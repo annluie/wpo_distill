@@ -3,6 +3,10 @@ import sklearn
 import sklearn.datasets
 from sklearn.utils import shuffle as util_shuffle
 
+#for cifar10
+import torch
+from torchvision import datasets, transforms
+from torch.utils.data import DataLoader
 
 # Dataset iterator
 def inf_train_gen(data, rng=None, batch_size=200):
@@ -126,5 +130,21 @@ def inf_train_gen(data, rng=None, batch_size=200):
         z4 =  rng.randn(batch_size) * 1.0
         z3 =  data[:,0] - 2*data[:,1] + rng.randn(batch_size) * 0.1
         return np.stack((data[:,0], data[:,1], z1, z2, z3, z4), 1)
+    elif data =='cifar10':
+        # Basic transform: convert to tensor and normalize to [-1, 1]
+        transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.5,), (0.5,)) # Normalize from [0,1] to [-1,1]
+        ])  
+        b = batch_size
+        train_dataset = datasets.CIFAR10(root='./data', train=True, download=True, transform=transform)
+        train_loader = DataLoader(train_dataset, batch_size=b, shuffle=True, num_workers=4)
+
+        # flatten images to [batch_size, 3072] for score model input (vs [batch_size, 3, 32, 32])
+        for images, _ in train_loader:
+            flat_images = images.view(images.size(0), -1)  # shape: [64, 3072]
+            print(flat_images.min(), flat_images.max())    # should be around -1 to 1
+            break
+        return flat_images
     else:
         return inf_train_gen("8gaussians", rng, batch_size)
