@@ -220,7 +220,8 @@ def score_implicit_matching(factornet,samples,centers):
     gradient_eval_log = grad_log_mog_density(samples,centers,precisions)
     # square gradient
     gradient_eval_log_squared = torch.sum(gradient_eval_log * gradient_eval_log, dim=1)
-
+    print(f"laplacian_over_density requires grad: {laplacian_over_density.requires_grad}")
+    print(f"gradient_eval_log requires grad: {gradient_eval_log.requires_grad}")
     #loss function
     loss = (2 * laplacian_over_density - gradient_eval_log_squared)
 
