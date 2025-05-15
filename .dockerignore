@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+*.dll
+*.exe
+*.log
+*.tar
+*.zip
+.venv/
+checkpoints/
+data/
