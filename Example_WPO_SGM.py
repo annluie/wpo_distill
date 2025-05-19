@@ -31,6 +31,9 @@ from pandas.plotting import scatter_matrix as pdsm
 #import functions_WPO_SGM as LearnCholesky
 import function_cpu as LearnCholesky
 import torch.multiprocessing as mp
+from memory_profiler import profile
+
+
 if __name__ == "__main__":
     install_dependencies()
     mp.set_start_method('spawn')  # Ensure the correct start method is used for Windows
@@ -96,13 +99,13 @@ if __name__ == "__main__":
     parser.add_argument('--data', choices=['swissroll', '8gaussians', 'pinwheel', 'circles', 'moons', '2spirals', 'checkerboard', 'rings','swissroll_6D_xy1', 'cifar10'], type = str,default = '2spirals')
     parser.add_argument('--depth',help = 'number of hidden layers of score network',type =int, default = 5)
     parser.add_argument('--hiddenunits',help = 'number of nodes per hidden layer', type = int, default = 64)
-    parser.add_argument('--niters',type = int, default = 5000)
-    parser.add_argument('--batch_size', type = int,default = 2)
+    parser.add_argument('--niters',type = int, default = 500)
+    parser.add_argument('--batch_size', type = int,default = 20)
     parser.add_argument('--lr',type = float, default = 2e-3) 
     parser.add_argument('--save',type = str,default = 'experiments/')
-    parser.add_argument('--train_kernel_size',type = int, default = 10)
-    parser.add_argument('--train_samples_size',type = int, default = 50)
-    parser.add_argument('--test_samples_size',type = int, default = 5)
+    parser.add_argument('--train_kernel_size',type = int, default = 100)
+    parser.add_argument('--train_samples_size',type = int, default = 500)
+    parser.add_argument('--test_samples_size',type = int, default = 50)
     args = parser.parse_args('')
 
 
@@ -128,6 +131,7 @@ if __name__ == "__main__":
 
 
     ## Cholesky factor model
+    @profile
     def construct_factor_model(dim:int, depth:int, hidden_units:int):
         '''
         Initializes neural network that models the Cholesky factor of the precision matrix # For nD examples (in theory)
@@ -148,7 +152,7 @@ if __name__ == "__main__":
 
     # In[6]:
 
-
+    @profile
     def evaluate_model(factornet, kernel_centers, num_test_sample):
         '''
         Evaluate the model by computing the average total loss over 10 batch of testing samples
@@ -166,6 +170,7 @@ if __name__ == "__main__":
         average_total_loss = total_loss_sum / 10
         return average_total_loss
 
+    @profile
     def save_training_slice_cov(factornet, means, epoch, lr, batch_size, loss_value, save):
         '''
         Save the training slice of the density plot
@@ -259,7 +264,7 @@ if __name__ == "__main__":
     depth = args.depth
     hidden_units = args.hiddenunits
     factornet = construct_factor_model(data_dim, depth, hidden_units).to(device).to(dtype = torch.float32)
-    factornet = torch.compile(factornet) # help speed up training
+    #factornet = torch.compile(factornet) # help speed up training
 
     lr = args.lr
     optimizer = optim.Adam(factornet.parameters(), lr=args.lr)
@@ -278,7 +283,7 @@ if __name__ == "__main__":
     formatted_loss = f'{loss:.3e}'  # Format the average with up to 1e-3 precision
     print(f'Before train, Average total_loss: {formatted_loss}')
 
-    print(torch.cuda.memory_summary(device=None, abbreviated=False))
+    #print(torch.cuda.memory_summary(device=None, abbreviated=False))
     # In[ ]:
 
 

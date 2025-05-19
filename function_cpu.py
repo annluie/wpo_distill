@@ -7,9 +7,12 @@ from torch.distributions.multivariate_normal import MultivariateNormal
 import lib.toy_data as toy_data
 import numpy as np
 import argparse
-
+from memory_profiler import profile
+from torch.cuda.amp import autocast
+from torch.utils.checkpoint import checkpoint
 
 ## vector to precision matrix function
+@profile
 def vectors_to_precision(vectors,dim):
     """
     Maps an array of 1xdim vectors into Cholesky factors and returns an array of precision matrices.
@@ -37,6 +40,7 @@ def vectors_to_precision(vectors,dim):
 #----------------------------------------------#
 
 # Compute MoG density for each data point
+@profile
 def mog_density(x, means, precisions):
     device = x.device
     num_components = means.shape[0]
@@ -57,6 +61,7 @@ def mog_density(x, means, precisions):
 
 
 # Compute gradient 
+@profile
 def gradient_mog_density(x, means, precisions):
     """
     Computes the gradient of the MoG density function with respect to the input x.
@@ -97,6 +102,7 @@ def gradient_mog_density(x, means, precisions):
     return gradient / num_components
 
 # Compute grad log pi
+@profile
 def grad_log_mog_density(x, means, precisions):
     x = x.unsqueeze(1)  # Shape: (batch_size, 1, 2)
     dim = x.size(-1)
@@ -127,7 +133,7 @@ def grad_log_mog_density(x, means, precisions):
 
 
 # Compute Laplacian
-
+@profile
 def laplacian_mog_density(x, means, precisions):
     """
     Computes the gradient of the MoG density function with respect to the input x.
@@ -166,7 +172,7 @@ def laplacian_mog_density(x, means, precisions):
     
     return laplacian
 
-
+@profile
 def laplacian_mog_density_div_density(x, means, precisions):
     x = x.unsqueeze(1)  # Shape: (batch_size, 1, 2)
     batch_size, num_components = x.size(0), means.size(0)
@@ -186,8 +192,9 @@ def laplacian_mog_density_div_density(x, means, precisions):
     x_mean = x - means  # Shape: (batch_size, num_components, 2)
 
     # Calculate the covariance matrix term
-    cov_term = torch.matmul(precisions, x_mean.unsqueeze(-1)).squeeze(-1)  # Shape: (batch_size, num_components, 2)
-
+    #cov_term = torch.matmul(precisions, x_mean.unsqueeze(-1)).squeeze(-1)  # Shape: (batch_size, num_components, 2)
+    cov_term = torch.einsum("kij,bkj->bki", precisions, x_mean)
+    
     # Calculate the squared linear term
     squared_linear = torch.sum(cov_term * cov_term, dim=-1)  # Shape: (batch_size, num_components)
 
@@ -209,19 +216,47 @@ def laplacian_mog_density_div_density(x, means, precisions):
 
 
 #----------------------------------------------#
+def laplacian_mog_density_div_density_chunked(x, means, precisions, chunk_size=2):
+    results = []
+    for i in range(0, x.size(0), chunk_size):
+        x_chunk = x[i:i+chunk_size]
+        result = laplacian_mog_density_div_density(x_chunk, means, precisions)
+        results.append(result)
+    return torch.cat(results, dim=0)
+
+@profile
 def score_implicit_matching(factornet,samples,centers):
+    # detach the samples and centers
+    samples = samples.detach()
+    centers = centers.detach()
+    with autocast("cuda"):
+        dim = centers.shape[-1]
+        factor_eval = checkpoint(factornet,centers)
+        precisions = vectors_to_precision(factor_eval,dim)
+        print(f"precisions requires grad: {precisions.requires_grad}")
+        print(f"samples requires grad: {samples.requires_grad}")
+        print(f"centers requires grad: {centers.requires_grad}")
+        #laplacian_over_density = laplacian_mog_density_div_density(samples,centers,precisions)
+        laplacian_over_density = laplacian_mog_density_div_density_chunked(samples,centers,precisions)
+        gradient_eval_log = grad_log_mog_density(samples,centers,precisions)
+        gradient_eval_log_squared = torch.sum(gradient_eval_log * gradient_eval_log, dim=1)
+    """
     # evaluate factor net
     factor_eval = factornet(centers) 
     # create precision matrix from the cholesky factor
     dim = centers.shape[-1]
     precisions = vectors_to_precision(factor_eval,dim)
-  
+    print(f"precisions requires grad: {precisions.requires_grad}")
+    print(f"samples requires grad: {samples.requires_grad}")
+    print(f"centers requires grad: {centers.requires_grad}")
     laplacian_over_density = laplacian_mog_density_div_density(samples,centers,precisions)
     gradient_eval_log = grad_log_mog_density(samples,centers,precisions)
     # square gradient
+    
     gradient_eval_log_squared = torch.sum(gradient_eval_log * gradient_eval_log, dim=1)
     print(f"laplacian_over_density requires grad: {laplacian_over_density.requires_grad}")
     print(f"gradient_eval_log requires grad: {gradient_eval_log.requires_grad}")
+    """
     #loss function
     loss = (2 * laplacian_over_density - gradient_eval_log_squared)
 
