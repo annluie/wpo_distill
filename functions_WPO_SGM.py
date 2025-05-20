@@ -420,12 +420,14 @@ def scatter_samples_from_model(means, precisions, dim1, dim2, epoch = 0,plot_num
 
     return None
 
-def plot_images(means, precisions, epoch = 0, plot_number = 1000, save_path=None):
+def plot_images(means, precisions, epoch = 0, plot_number = 10, save_path=None):
     # plots plot_number samples from the trained model for image data
-
+    num_components = means.shape[0]
     # sample from the multivariate normal distribution
-    multivariate_normal = torch.distributions.MultivariateNormal(means, precision_matrix=precisions)
-    samples = multivariate_normal.sample((plot_number,))
+    comp_num = torch.randint(0, num_components, (1,plot_number)) #shape: [1, plot_number]
+    comp_num = comp_num.squeeze(0)  # shape: [plot_number]
+    multivariate_normal = torch.distributions.MultivariateNormal(means[comp_num], precision_matrix=precisions[comp_num])
+    samples = multivariate_normal.rsample()
     # transform images back to original data 
     samples = samples.view(-1, 3, 32, 32)
     samples = samples * 0.5 + 0.5
@@ -435,7 +437,7 @@ def plot_images(means, precisions, epoch = 0, plot_number = 1000, save_path=None
         axs[i].imshow(img)
         axs[i].axis('off')
     if save_path is not None:
-        save_path = save_path + 'epoch'+ str(epoch) +'_scatter_dim_' + '.png'
+        save_path = save_path + 'epoch'+ str(epoch) + '.png'
         plt.savefig(save_path)
     
     plt.close(fig)

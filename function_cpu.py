@@ -13,7 +13,7 @@ from torch.utils.checkpoint import checkpoint
 import gc
 
 ## vector to precision matrix function
-@profile
+#@profile
 def vectors_to_precision(vectors,dim):
     """
     Maps an array of 1xdim vectors into Cholesky factors and returns an array of precision matrices.
@@ -41,7 +41,7 @@ def vectors_to_precision(vectors,dim):
 #----------------------------------------------#
 
 # Compute MoG density for each data point
-@profile
+#@profile
 def mog_density(x, means, precisions):
     device = x.device
     num_components = means.shape[0]
@@ -62,7 +62,7 @@ def mog_density(x, means, precisions):
 
 
 # Compute gradient 
-@profile
+#@profile
 def gradient_mog_density(x, means, precisions):
     """
     Computes the gradient of the MoG density function with respect to the input x.
@@ -103,7 +103,7 @@ def gradient_mog_density(x, means, precisions):
     return gradient / num_components
 
 # Compute grad log pi
-@profile
+#@profile
 def grad_log_mog_density(x, means, precisions):
     x = x.unsqueeze(1)  # Shape: (batch_size, 1, 2)
     dim = x.size(-1)
@@ -116,7 +116,7 @@ def grad_log_mog_density(x, means, precisions):
     log_probs = mvns.log_prob(x)  # Shape: (batch_size, num_components)
 
     # Use torch.logsumexp to compute the log of the sum of exponentiated log probabilities
-    log_sum_exp = torch.logsumexp(log_probs, dim=1, keepdim=True)  # Shape: (batch_size, 1)
+    # log_sum_exp = torch.logsumexp(log_probs, dim=1, keepdim=True)  # Shape: (batch_size, 1) #i don't think this is used anywhere
 
     # Calculate the softmax probabilities along the components dimension
     
@@ -146,7 +146,7 @@ def grad_log_mog_density(x, means, precisions):
 
 
 # Compute Laplacian
-@profile
+#@profile
 def laplacian_mog_density(x, means, precisions):
     """
     Computes the gradient of the MoG density function with respect to the input x.
@@ -185,7 +185,7 @@ def laplacian_mog_density(x, means, precisions):
     
     return laplacian
 
-@profile
+#@profile
 def laplacian_mog_density_div_density(x, means, precisions):
     x = x.unsqueeze(1)  # Shape: (batch_size, 1, 2)
     batch_size, num_components = x.size(0), means.size(0)
@@ -233,7 +233,7 @@ def laplacian_mog_density_div_density(x, means, precisions):
 
 
 #----------------------------------------------#
-@profile
+#@profile
 def laplacian_mog_density_div_density_chunked(x, means, precisions, chunk_size=16):
     results = []
     for i in range(0, x.size(0), chunk_size):
@@ -245,7 +245,7 @@ def laplacian_mog_density_div_density_chunked(x, means, precisions, chunk_size=1
         torch.cuda.empty_cache()
     return torch.cat(results, dim=0)
 
-@profile
+#@profile
 def score_implicit_matching(factornet,samples,centers):
     # detach the samples and centers
     #samples = samples.detach()
@@ -481,12 +481,14 @@ def scatter_samples_from_model(means, precisions, dim1, dim2, epoch = 0,plot_num
 
     return None
 
-def plot_images(means, precisions, epoch = 0, plot_number = 1000, save_path=None):
+def plot_images(means, precisions, epoch = 0, plot_number = 10, save_path=None):
     # plots plot_number samples from the trained model for image data
-
+    num_components = means.shape[0]
     # sample from the multivariate normal distribution
-    multivariate_normal = torch.distributions.MultivariateNormal(means, precision_matrix=precisions)
-    samples = multivariate_normal.sample((plot_number,))
+    comp_num = torch.randint(0, num_components, (1,plot_number)) #shape: [1, plot_number]
+    comp_num = comp_num.squeeze(0)  # shape: [plot_number]
+    multivariate_normal = torch.distributions.MultivariateNormal(means[comp_num], precision_matrix=precisions[comp_num])
+    samples = multivariate_normal.rsample()
     # transform images back to original data 
     samples = samples.view(-1, 3, 32, 32)
     samples = samples * 0.5 + 0.5
@@ -496,9 +498,7 @@ def plot_images(means, precisions, epoch = 0, plot_number = 1000, save_path=None
         axs[i].imshow(img)
         axs[i].axis('off')
     if save_path is not None:
-        save_path = save_path + 'epoch'+ str(epoch) +'_scatter_dim_' + '.png'
+        save_path = save_path + 'epoch'+ str(epoch) + '.png'
         plt.savefig(save_path)
     
     plt.close(fig)
-
-    return None
