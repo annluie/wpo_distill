@@ -10,6 +10,7 @@ import argparse
 from memory_profiler import profile
 from torch.cuda.amp import autocast
 from torch.utils.checkpoint import checkpoint
+import gc
 
 ## vector to precision matrix function
 @profile
@@ -118,17 +119,29 @@ def grad_log_mog_density(x, means, precisions):
     log_sum_exp = torch.logsumexp(log_probs, dim=1, keepdim=True)  # Shape: (batch_size, 1)
 
     # Calculate the softmax probabilities along the components dimension
+    
     softmax_probs = torch.softmax(log_probs, dim=1)  # Shape: (batch_size, num_components)
     x_mean = x - means  # Shape: (batch_size, num_components, 2)
+    """
     x_mean_reshaped = x_mean.view(batch_size, num_components, dim, 1)
     precision_matrix = precisions.unsqueeze(0)  # Shape: (1, num_components, 2, 2)
     precision_matrix = precision_matrix.expand(x.shape[0], -1, -1, -1)  # Shape: (batch_size, num_components, 2, 2)
 
     x_mean_cov = torch.matmul(precision_matrix, x_mean_reshaped).squeeze(dim = -1)
+    print(f"matmul mean cov: {x_mean_cov}")
+    del x_mean_cov
+    gc.collect()
+    torch.cuda.empty_cache()
+    """
+    # calculate without resizing (more memory efficient)
+    x_mean_cov = torch.einsum('kij,bkj->bki', precisions, x_mean)
+    
     # Calculate the gradient of log density with respect to x
 
     gradient = -torch.sum(softmax_probs.unsqueeze(-1) * x_mean_cov, dim=1)
-    
+    del x_mean_cov
+    gc.collect()
+    torch.cuda.empty_cache()
     return gradient
 
 
@@ -210,29 +223,39 @@ def laplacian_mog_density_div_density(x, means, precisions):
 
     # Sum over components to obtain the Laplacian of the density over the density
     laplacian_over_density = torch.sum(laplacian_component, dim=1)  # Shape: (batch_size,)
-
+    
+    #free up memory 
+    del mvns, log_probs, log_sum_exp, softmax_probs, x_mean, cov_term
+    gc.collect()
+    torch.cuda.empty_cache()
     return laplacian_over_density
 
 
 
 #----------------------------------------------#
-def laplacian_mog_density_div_density_chunked(x, means, precisions, chunk_size=2):
+@profile
+def laplacian_mog_density_div_density_chunked(x, means, precisions, chunk_size=16):
     results = []
     for i in range(0, x.size(0), chunk_size):
-        x_chunk = x[i:i+chunk_size]
+        x_chunk = x[i:i+chunk_size].detach().clone().requires_grad_(x.requires_grad)
         result = laplacian_mog_density_div_density(x_chunk, means, precisions)
-        results.append(result)
+        results.append(result.detach() if not result.requires_grad else result)
+        del result, x_chunk
+        gc.collect()
+        torch.cuda.empty_cache()
     return torch.cat(results, dim=0)
 
 @profile
 def score_implicit_matching(factornet,samples,centers):
     # detach the samples and centers
-    samples = samples.detach()
-    centers = centers.detach()
-    with autocast("cuda"):
-        dim = centers.shape[-1]
-        factor_eval = checkpoint(factornet,centers)
-        precisions = vectors_to_precision(factor_eval,dim)
+    #samples = samples.detach()
+    #centers = centers.detach()
+    centers.requires_grad_(True)
+    dim = centers.shape[-1]
+    factor_eval = checkpoint(factornet,centers)
+    precisions = vectors_to_precision(factor_eval,dim)
+    #with autocast("cuda"):
+    with autocast('cpu', dtype=torch.bfloat16):
         print(f"precisions requires grad: {precisions.requires_grad}")
         print(f"samples requires grad: {samples.requires_grad}")
         print(f"centers requires grad: {centers.requires_grad}")
@@ -240,6 +263,8 @@ def score_implicit_matching(factornet,samples,centers):
         laplacian_over_density = laplacian_mog_density_div_density_chunked(samples,centers,precisions)
         gradient_eval_log = grad_log_mog_density(samples,centers,precisions)
         gradient_eval_log_squared = torch.sum(gradient_eval_log * gradient_eval_log, dim=1)
+        print(f"laplacian_over_density requires grad: {laplacian_over_density.requires_grad}")
+        print(f"gradient_eval_log requires grad: {gradient_eval_log.requires_grad}")
     """
     # evaluate factor net
     factor_eval = factornet(centers) 
