@@ -33,7 +33,8 @@ from pandas.plotting import scatter_matrix as pdsm
 import function_cpu as LearnCholesky
 import torch.multiprocessing as mp
 from memory_profiler import profile
-
+from tqdm import trange
+import gc
 
 if __name__ == "__main__":
     install_dependencies()
@@ -49,7 +50,7 @@ if __name__ == "__main__":
     #os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
     #os.environ["CUDA_VISIBLE_DEVICES"]="0"
     #os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:32"
-    """
+    """'''
     if torch.cuda.is_available():
         device = torch.device('cuda')
         print("GPU is available")
@@ -58,7 +59,7 @@ if __name__ == "__main__":
         print("GPU is not available")
     print(device)
     """
-    """
+    
     try:
         if torch.cuda.is_available():
             # Check how many GPUs are actually detected
@@ -83,9 +84,9 @@ if __name__ == "__main__":
         device = torch.device('cpu')
         print(f"Falling back to CPU: {device}")
 
-    device = torch.device("cuda:1")
+    #device = torch.device("cuda:1")
     #model.to(device)
-
+    """
     #clear memory
     import gc
     torch.cuda.empty_cache()
@@ -94,7 +95,7 @@ if __name__ == "__main__":
     # ### Parsing for scripts
     """
     # In[3]:
-    device=torch.device('cpu')
+    #device=torch.device('cpu')
 
 parser = argparse.ArgumentParser(' ')
 parser.add_argument('--data', choices=['swissroll', '8gaussians', 'pinwheel', 'circles', 'moons', '2spirals', 'checkerboard', 'rings','swissroll_6D_xy1', 'cifar10'], type = str,default = '2spirals')
@@ -111,20 +112,18 @@ args = parser.parse_args('')
 
 
     # In[4]:
-
-
-    train_kernel_size = args.train_kernel_size
-    train_samples_size = args.train_samples_size
-    test_samples_size = args.test_samples_size
-    dataset = args.data 
-    save_directory = args.save + 'test'+'/'
-
-    print('save_directory',save_directory)
-
-    if not os.path.exists(save_directory):
-        os.makedirs(save_directory)
-        print('Created directory ' + save_directory)
-
+train_kernel_size = args.train_kernel_size
+train_samples_size = args.train_samples_size
+test_samples_size = args.test_samples_size
+dataset = args.data 
+save_directory = args.save + 'test'+'/'
+    
+print('save_directory',save_directory)
+    
+if not os.path.exists(save_directory):
+    os.makedirs(save_directory)
+    print('Created directory ' + save_directory)
+    
     #print(torch.cuda.memory_summary(device=None, abbreviated=False))
     # ### Precision matrix model
 
@@ -158,19 +157,20 @@ def evaluate_model(factornet, kernel_centers, num_test_sample):
     '''
     Evaluate the model by computing the average total loss over 10 batch of testing samples
     '''
-    total_loss_sum = 0
-    device = kernel_centers.device
-    for i in range(10):
-        p_samples = toy_data.inf_train_gen(dataset,batch_size = num_test_sample)
-        testing_samples = torch.tensor(p_samples).to(dtype = torch.float32).to(device)
-        total_loss = LearnCholesky.score_implicit_matching(factornet,testing_samples,kernel_centers)
-        total_loss_sum += total_loss.item()
-         # Free up memory
-        del p_samples, testing_samples, total_loss
-        #gc.collect() #only if using CPU
-        torch.cuda.empty_cache()  # Only if using GPU
-    average_total_loss = total_loss_sum / 10
-    return average_total_loss
+    with torch.no_grad():
+        total_loss_sum = 0
+        device = kernel_centers.device
+        for i in range(10):
+            p_samples = toy_data.inf_train_gen(dataset,batch_size = num_test_sample)
+            testing_samples = torch.tensor(p_samples).to(dtype = torch.float32).to(device)
+            total_loss = LearnCholesky.score_implicit_matching(factornet,testing_samples,kernel_centers)
+            total_loss_sum += total_loss.item()
+            # Free up memory
+            del p_samples, testing_samples, total_loss
+            #gc.collect() #only if using CPU
+            torch.cuda.empty_cache()  # Only if using GPU
+        average_total_loss = total_loss_sum / 10
+        return average_total_loss
 
 def save_training_slice_cov(factornet, means, epoch, lr, batch_size, loss_value, save):
     '''
@@ -228,51 +228,26 @@ def save_training_slice_cov(factornet, means, epoch, lr, batch_size, loss_value,
 
     # ### Initialize score network
 
-# In[8]:
-
-
-    # check the dataset
-    dataset = args.data
-    #dataset = 'swissroll'
-    #dataset = 'swissroll_6D_xy1'
-    #means  = torch.tensor(toy_data.inf_train_gen(dataset, batch_size = 1000)).to(dtype = torch.float32)
-    #data_dim = means.shape[1]
-    #print('data_dim',data_dim)
-
-    #blah = pd.DataFrame(means)
-    #pdsm(blah)
-
-
-    # ## Initialize Data using CIFAR-10
-    # 
 
 # In[9]:
 
 
-    # check the dataset
-    dataset = args.data
-    dataset = 'cifar10'
+# check the dataset
+dataset = args.data
+dataset = 'cifar10'
 
-    means  = torch.tensor(toy_data.inf_train_gen(dataset, batch_size = train_kernel_size)).to(dtype = torch.float32)
-    data_dim = means.shape[1]
-    # dataset = 'swissroll_6D_xy1'
-    """"" # not used anymore since our data is pictures
-    means  = torch.tensor(toy_data.inf_train_gen(dataset, batch_size = 1000)).to(dtype = torch.float32)
-    data_dim = means.shape[1]
-    print('data_dim',data_dim)
+means  = torch.tensor(toy_data.inf_train_gen(dataset, batch_size = train_kernel_size)).to(dtype = torch.float32)
+data_dim = means.shape[1]
 
-    blah = pd.DataFrame(means)
-    pdsm(blah)
-    """
-    #print(torch.cuda.memory_summary(device=None, abbreviated=False))
+#print(torch.cuda.memory_summary(device=None, abbreviated=False))
 
     # In[ ]:
 
 
-    depth = args.depth
-    hidden_units = args.hiddenunits
-    factornet = construct_factor_model(data_dim, depth, hidden_units).to(device).to(dtype = torch.float32)
-    #factornet = torch.compile(factornet) # help speed up training
+depth = args.depth
+hidden_units = args.hiddenunits
+factornet = construct_factor_model(data_dim, depth, hidden_units).to(device).to(dtype = torch.float32)
+#factornet = torch.compile(factornet) # help speed up training
 
 lr = args.lr
 optimizer = optim.Adam(factornet.parameters(), lr=args.lr)
@@ -281,11 +256,10 @@ p_samples = toy_data.inf_train_gen(dataset,batch_size = train_samples_size)
 training_samples = torch.tensor(p_samples).to(dtype = torch.float32).to(device)
 centers  = torch.tensor(toy_data.inf_train_gen(dataset, batch_size = train_kernel_size)).to(dtype = torch.float32).to(device)
 
-torch.save(centers, save_directory + str(epochs) + 'epochs' + str(train_kernel_size) + 'centers.pt')
-
 epochs = args.niters
 batch_size = args.batch_size
 
+torch.save(centers, save_directory + str(epochs) + 'epochs' + str(train_kernel_size) + 'centers.pt')
 # Training the score network
 loss = evaluate_model(factornet, centers, test_samples_size)
 formatted_loss = f'{loss:.3e}'  # Format the average with up to 1e-3 precision
@@ -370,7 +344,7 @@ save_training_slice_cov(factornet, centers, step, lr, batch_size, loss0, save_di
 formatted_loss = f'{loss:.3e}'  # Format the average with up to 1e-3 precision
 print(f'After train, Average total_loss: {formatted_loss}')
 
-    print(torch.cuda.memory_summary(device=None, abbreviated=False))
+print(torch.cuda.memory_summary(device=None, abbreviated=False))
     # In[ ]:
 
 
@@ -378,16 +352,16 @@ print(f'After train, Average total_loss: {formatted_loss}')
 # and plot density
 #file /wpo_distill/cifar10_experiments/test/epoch499model_weights.pth
 #factornet.load_state_dict(torch.load('wpo_distill/cifar10_experiments/test/epoch499model_weights.pth'))
+"""
 print(os.path.exists("/home/jupyter/wpo_distill/cifar10_experiments/test/epoch499model_weights.pth"))
 print("Current working dir:", os.getcwd())
 model = construct_factor_model(data_dim, depth, hidden_units).to(device).to(dtype = torch.float32)
 model.load_state_dict(torch.load("/home/jupyter/wpo_distill/cifar10_experiments/test/epoch499model_weights.pth"))
-
+"""
 with torch.no_grad():
         
-    precisions = LearnCholesky.vectors_to_precision(model(centers),data_dim)
-
-    LearnCholesky.plot_images(centers, precisions, epoch = 49, plot_number=10, save_path=save_directory + 'samples')
+    precisions = LearnCholesky.vectors_to_precision(factornet(centers),data_dim)
+    LearnCholesky.plot_images(centers, precisions, epoch = epochs, plot_number=10, save_path=save_directory + 'samples')
 
 """ I think this will not work for general (centers needs to be same as before to plot properly)
 randind = torch.randint(0,1000,[1000,])
