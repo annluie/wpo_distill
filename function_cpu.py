@@ -8,7 +8,7 @@ import lib.toy_data as toy_data
 import numpy as np
 import argparse
 from memory_profiler import profile
-from torch.cuda.amp import autocast
+from torch.amp import autocast
 from torch.utils.checkpoint import checkpoint
 import gc
 
@@ -233,7 +233,8 @@ def laplacian_mog_density_div_density(x, means, precisions):
 
 
 #----------------------------------------------#
-#@profile
+#BATCHED VERSIONS
+@profile
 def laplacian_mog_density_div_density_chunked(x, means, precisions, chunk_size=16):
     results = []
     for i in range(0, x.size(0), chunk_size):
@@ -244,8 +245,18 @@ def laplacian_mog_density_div_density_chunked(x, means, precisions, chunk_size=1
         gc.collect()
         torch.cuda.empty_cache()
     return torch.cat(results, dim=0)
-
-#@profile
+@profile
+def grad_log_mog_density_chunked(x, means, precisions, chunk_size=16):
+    results = []
+    for i in range(0, x.size(0), chunk_size):
+        x_chunk = x[i:i+chunk_size].detach().clone().requires_grad_(x.requires_grad)
+        result = grad_log_mog_density(x_chunk, means, precisions)
+        results.append(result.detach() if not result.requires_grad else result)
+        del result, x_chunk
+        gc.collect()
+        torch.cuda.empty_cache()
+    return torch.cat(results, dim=0)
+#----------------------------------------------#
 def score_implicit_matching(factornet,samples,centers):
     # detach the samples and centers
     #samples = samples.detach()
@@ -256,32 +267,9 @@ def score_implicit_matching(factornet,samples,centers):
     precisions = vectors_to_precision(factor_eval,dim)
     #with autocast("cuda"):
     with autocast('cpu', dtype=torch.bfloat16):
-        print(f"precisions requires grad: {precisions.requires_grad}")
-        print(f"samples requires grad: {samples.requires_grad}")
-        print(f"centers requires grad: {centers.requires_grad}")
-        #laplacian_over_density = laplacian_mog_density_div_density(samples,centers,precisions)
         laplacian_over_density = laplacian_mog_density_div_density_chunked(samples,centers,precisions)
-        gradient_eval_log = grad_log_mog_density(samples,centers,precisions)
+        gradient_eval_log = grad_log_mog_density_chunked(samples,centers,precisions)
         gradient_eval_log_squared = torch.sum(gradient_eval_log * gradient_eval_log, dim=1)
-        print(f"laplacian_over_density requires grad: {laplacian_over_density.requires_grad}")
-        print(f"gradient_eval_log requires grad: {gradient_eval_log.requires_grad}")
-    """
-    # evaluate factor net
-    factor_eval = factornet(centers) 
-    # create precision matrix from the cholesky factor
-    dim = centers.shape[-1]
-    precisions = vectors_to_precision(factor_eval,dim)
-    print(f"precisions requires grad: {precisions.requires_grad}")
-    print(f"samples requires grad: {samples.requires_grad}")
-    print(f"centers requires grad: {centers.requires_grad}")
-    laplacian_over_density = laplacian_mog_density_div_density(samples,centers,precisions)
-    gradient_eval_log = grad_log_mog_density(samples,centers,precisions)
-    # square gradient
-    
-    gradient_eval_log_squared = torch.sum(gradient_eval_log * gradient_eval_log, dim=1)
-    print(f"laplacian_over_density requires grad: {laplacian_over_density.requires_grad}")
-    print(f"gradient_eval_log requires grad: {gradient_eval_log.requires_grad}")
-    """
     #loss function
     loss = (2 * laplacian_over_density - gradient_eval_log_squared)
 

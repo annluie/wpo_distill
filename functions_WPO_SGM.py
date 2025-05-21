@@ -7,6 +7,10 @@ from torch.distributions.multivariate_normal import MultivariateNormal
 import lib.toy_data as toy_data
 import numpy as np
 import argparse
+from memory_profiler import profile
+from torch.cuda.amp import autocast
+from torch.utils.checkpoint import checkpoint
+import gc
 
 
 ## vector to precision matrix function
@@ -109,25 +113,35 @@ def grad_log_mog_density(x, means, precisions):
     log_probs = mvns.log_prob(x)  # Shape: (batch_size, num_components)
 
     # Use torch.logsumexp to compute the log of the sum of exponentiated log probabilities
-    log_sum_exp = torch.logsumexp(log_probs, dim=1, keepdim=True)  # Shape: (batch_size, 1)
+    # log_sum_exp = torch.logsumexp(log_probs, dim=1, keepdim=True)  # Shape: (batch_size, 1) #i don't think this is used anywhere
 
     # Calculate the softmax probabilities along the components dimension
+    
     softmax_probs = torch.softmax(log_probs, dim=1)  # Shape: (batch_size, num_components)
     x_mean = x - means  # Shape: (batch_size, num_components, 2)
+    """
     x_mean_reshaped = x_mean.view(batch_size, num_components, dim, 1)
     precision_matrix = precisions.unsqueeze(0)  # Shape: (1, num_components, 2, 2)
     precision_matrix = precision_matrix.expand(x.shape[0], -1, -1, -1)  # Shape: (batch_size, num_components, 2, 2)
 
     x_mean_cov = torch.matmul(precision_matrix, x_mean_reshaped).squeeze(dim = -1)
+    print(f"matmul mean cov: {x_mean_cov}")
+    del x_mean_cov
+    gc.collect()
+    torch.cuda.empty_cache()
+    """
+    # calculate without resizing (more memory efficient)
+    x_mean_cov = torch.einsum('kij,bkj->bki', precisions, x_mean)
+    
     # Calculate the gradient of log density with respect to x
 
     gradient = -torch.sum(softmax_probs.unsqueeze(-1) * x_mean_cov, dim=1)
-    
+    del x_mean_cov
+    gc.collect()
+    torch.cuda.empty_cache()
     return gradient
 
-
 # Compute Laplacian
-
 def laplacian_mog_density(x, means, precisions):
     """
     Computes the gradient of the MoG density function with respect to the input x.
@@ -205,27 +219,52 @@ def laplacian_mog_density_div_density(x, means, precisions):
     laplacian_over_density = torch.sum(laplacian_component, dim=1)  # Shape: (batch_size,)
 
     return laplacian_over_density
-
-
-
+#----------------------------------------------#
+#BATCHED VERSIONS
+@profile
+def laplacian_mog_density_div_density_chunked(x, means, precisions, chunk_size=16):
+    results = []
+    for i in range(0, x.size(0), chunk_size):
+        x_chunk = x[i:i+chunk_size].detach().clone().requires_grad_(x.requires_grad)
+        result = laplacian_mog_density_div_density(x_chunk, means, precisions)
+        results.append(result.detach() if not result.requires_grad else result)
+        del result, x_chunk
+        gc.collect()
+        torch.cuda.empty_cache()
+    return torch.cat(results, dim=0)
+@profile
+def grad_log_mog_density_chunked(x, means, precisions, chunk_size=16):
+    results = []
+    for i in range(0, x.size(0), chunk_size):
+        x_chunk = x[i:i+chunk_size].detach().clone().requires_grad_(x.requires_grad)
+        result = grad_log_mog_density(x_chunk, means, precisions)
+        results.append(result.detach() if not result.requires_grad else result)
+        del result, x_chunk
+        gc.collect()
+        torch.cuda.empty_cache()
+    return torch.cat(results, dim=0)
 #----------------------------------------------#
 def score_implicit_matching(factornet,samples,centers):
-    # evaluate factor net
-    factor_eval = factornet(centers) 
-    # create precision matrix from the cholesky factor
+    # detach the samples and centers
+    #samples = samples.detach()
+    #centers = centers.detach()
+    centers.requires_grad_(True)
     dim = centers.shape[-1]
+    factor_eval = checkpoint(factornet,centers)
     precisions = vectors_to_precision(factor_eval,dim)
-  
-    laplacian_over_density = laplacian_mog_density_div_density(samples,centers,precisions)
-    gradient_eval_log = grad_log_mog_density(samples,centers,precisions)
-    # square gradient
-    gradient_eval_log_squared = torch.sum(gradient_eval_log * gradient_eval_log, dim=1)
-
+    #with autocast("cuda"):
+    with autocast('cpu', dtype=torch.bfloat16):
+        #print(f"precisions requires grad: {precisions.requires_grad}")
+        #print(f"samples requires grad: {samples.requires_grad}")
+        #print(f"centers requires grad: {centers.requires_grad}")
+        #laplacian_over_density = laplacian_mog_density_div_density(samples,centers,precisions)
+        laplacian_over_density = laplacian_mog_density_div_density_chunked(samples,centers,precisions)
+        gradient_eval_log = grad_log_mog_density_chunked(samples,centers,precisions)
+        gradient_eval_log_squared = torch.sum(gradient_eval_log * gradient_eval_log, dim=1)
     #loss function
     loss = (2 * laplacian_over_density - gradient_eval_log_squared)
 
     return loss.mean(dim =0)
-
 
 
 #----------------------------------------------#
