@@ -494,7 +494,7 @@ def plot_images(means, precisions, epoch = 0, plot_number = 10, save_path=None):
     samples = samples * 0.5 + 0.5
     fig, axs = plt.subplots(1, plot_number, figsize=(15, 2))
     for i in range(plot_number):
-        img = samples[i].permute(1, 2, 0).numpy()  # change from [C, H, W] to [H, W, C]
+        img = samples[i].permute(1, 2, 0).detatch().numpy()  # change from [C, H, W] to [H, W, C]
         axs[i].imshow(img)
         axs[i].axis('off')
     if save_path is not None:
