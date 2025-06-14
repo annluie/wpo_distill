@@ -30,7 +30,7 @@ import argparse
 import pandas as pd
 from pandas.plotting import scatter_matrix as pdsm
 #import functions_WPO_SGM as LearnCholesky
-import function_cpu as LearnCholesky
+import WPO_SGM.function_cpu as LearnCholesky
 import torch.multiprocessing as mp
 from memory_profiler import profile
 from tqdm import trange

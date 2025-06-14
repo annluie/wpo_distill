@@ -7,3 +7,5 @@ torchvision
 tdqm
 argparse
 gc
+memory_profiler 
+
