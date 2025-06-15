@@ -41,17 +41,12 @@ from WPO_SGM import functions_WPO_SGM as LearnCholesky
 # ------------------- CHECK GPUS -------------------
 # check how many GPUs are available
 if torch.cuda.is_available():
-    print(f"Number of GPUs available: {torch.cuda.device_count()}")
-    # Initialize distributed training
-    dist.init_process_group(backend="nccl")
-    local_rank = int(os.environ["LOCAL_RANK"])  # Set by torchrun
-    device = torch.device(f"cuda:{local_rank}")
-    torch.cuda.set_device(device)
+    devices = list(range(torch.cuda.device_count()))
+    device = torch.device('cuda:0')
+    print(f"Using {len(devices)} GPUs with DataParallel: {devices}")
 else:
-    print("No GPUs available, using CPU.")
-    devices = [torch.device('cpu')]
+    devices = ['cpu']
     device = torch.device('cpu')
-
 #device = torch.device('cpu')
 
 # ------------------- SET PARAMETERS -------------------

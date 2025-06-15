@@ -35,6 +35,5 @@ RUN pip install --no-cache-dir -r requirements.txt && \
 # Optional: expose port if it's a web app
 # EXPOSE 8080
 
-ENTRYPOINT ["torchrun"]
-
-CMD ["--nproc_per_node=2", "train_wpo_sgm.py"]
+ENTRYPOINT ["python"]
+CMD ["train_wpo_sgm.py"]

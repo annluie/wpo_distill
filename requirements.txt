@@ -6,6 +6,5 @@ torch>=2.0
 torchvision
 tdqm
 argparse
-gc
 memory_profiler 
 

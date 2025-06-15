@@ -11,3 +11,7 @@ __pycache__/
 .venv/
 checkpoints/
 data/
+
+# Ignore Git files
+.git
+.gitignore
