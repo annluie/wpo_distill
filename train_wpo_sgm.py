@@ -189,20 +189,38 @@ def opt_check(factornet, samples, centers, optimizer, scaler):
     return loss
 
 #----------------------- SAVE FUNCTIONS -------------------
+import os
+
 def save_training_slice_cov(factornet, means, epoch, lr, batch_size, save):
     '''
-    Save the training slice of the NN
+    Save the training slice of the NN in parameter-based subfolders,
+    with epoch appended to the filename.
     '''
     if save is not None:
-        filename = os.path.join(save,
-                                f"sample_size{train_samples_size}_test_size{test_samples_size}_batch_size{batch_size}_centers{train_kernel_size}_lr{lr}_epoch{epoch:04d}"
-                                )
-        # Save clean model weights even if using DataParallel
+        # Create subfolders for all parameters except epoch
+        subfolder = os.path.join(
+            save,
+            f"sample_size{train_samples_size}",
+            f"test_size{test_samples_size}",
+            f"batch_size{batch_size}",
+            f"centers{train_kernel_size}",
+            f"lr{lr}"
+        )
+        os.makedirs(subfolder, exist_ok=True)
+
+        # Create filename with epoch appended
+        filename = os.path.join(subfolder, f"epoch{epoch:04d}_factornet.pth")
+
+        # Save model weights
         state_dict = factornet.module.state_dict() if isinstance(factornet, nn.DataParallel) else factornet.state_dict()
-        torch.save(state_dict, filename + '_factornet.pth')
-        logging.info(f"Saved model checkpoint to {filename + '_factornet.pth'}")
-        #save the centers
-        #torch.save(means, filename + 'centers.pth')
+        torch.save(state_dict, filename)
+        logging.info(f"Saved model checkpoint to {filename}")
+
+        # Save centers if needed
+        # centers_filename = os.path.join(subfolder, f"epoch{epoch:04d}_centers.pth")
+        # torch.save(means, centers_filename)
+        # logging.info(f"Saved centers to {centers_filename}")
+
 
 def save_training_slice_log(iter_time, loss_time, epoch, max_mem, loss_value, save):
     '''
@@ -252,11 +270,17 @@ optimizer = optim.Adam(factornet.parameters(), lr=args.lr)
 p_samples = toy_data.inf_train_gen(dataset,batch_size = train_samples_size)
 training_samples = torch.tensor(p_samples, dtype=torch.float32, device=device)
 
-
-filename_final = os.path.join(save_directory,
-                                f"sample_size{train_samples_size}_test_size{test_samples_size}_batch_size{batch_size}_centers{train_kernel_size}_lr{lr}"
-                            )
-torch.save(centers, filename_final + 'centers.pt') #save the centers (we fix them in the beginning)
+subfolder = os.path.join(
+            save_directory,
+            f"sample_size{train_samples_size}",
+            f"test_size{test_samples_size}",
+            f"batch_size{batch_size}",
+            f"centers{train_kernel_size}",
+            f"lr{lr}"
+        )
+os.makedirs(subfolder, exist_ok=True)
+filename_final = os.path.join(subfolder, 'centers.pt')
+torch.save(centers, filename_final) #save the centers (we fix them in the beginning)
 del p_samples
 
 ###########################
