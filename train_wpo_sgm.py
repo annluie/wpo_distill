@@ -54,7 +54,7 @@ else:
 torch.set_float32_matmul_precision('high') # set precision for efficient matrix multiplication
 
 # setup argument parser
-parser = argparse.ArgumentParser(' ')
+parser = argparse.ArgumentParser()
 parser.add_argument('--data', choices=['swissroll', '8gaussians', 'pinwheel', 'circles', 'moons', '2spirals', 'checkerboard', 'rings','swissroll_6D_xy1', 'cifar10'], type = str,default = 'cifar10')
 parser.add_argument('--depth',help = 'number of hidden layers of score network',type =int, default = 5)
 parser.add_argument('--hiddenunits',help = 'number of nodes per hidden layer', type = int, default = 64)
@@ -67,7 +67,7 @@ parser.add_argument('--train_samples_size',type = int, default = 500)
 parser.add_argument('--test_samples_size',type = int, default = 5)
 parser.add_argument('--load_model_path', type = str, default = None)
 parser.add_argument('--load_centers_path', type = str, default = None)
-args = parser.parse_args('')
+args = parser.parse_args()
 
 # set parameters from args
 train_kernel_size = args.train_kernel_size
@@ -144,7 +144,7 @@ def load_model(model, centers, load_model_path, load_centers_path):
         
         model.load_state_dict(state_dict)
         logging.info(f"Loaded model weights from {load_model_path}")
-    
+
     if load_centers_path is not None and os.path.exists(load_centers_path):
         centers = torch.load(load_centers_path, map_location=device)
         logging.info(f"Loaded centers from {load_centers_path}")
@@ -259,6 +259,11 @@ centers = torch.tensor(
 # Load model and centers if specified
 if load_model_path or load_centers_path:
     print("loading model")
+    save_directory = os.path.dirname(load_model_path) if load_model_path else save_directory
+    new_dir = os.path.join(save_directory, "loaded")
+    if not os.path.exists(new_dir):
+        os.makedirs(new_dir)
+    save_directory = new_dir  # ✅ Set after creation
     factornet, centers = load_model(factornet, centers, load_model_path, load_centers_path)
 factornet = nn.DataParallel(factornet, device_ids=devices) # Wrap model in DataParallel, must be done after loading the model
 #factornet = torch.compile(factornet, mode="reduce-overhead") # must be compiled after DataParallel
