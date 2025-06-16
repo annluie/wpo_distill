@@ -591,35 +591,33 @@ def scatter_samples_from_model(means, precisions, dim1, dim2, epoch = 0,plot_num
     plt.close(fig)
 
     return None
+
 def sample_from_model(factornet, means, sample_number):
-    # plots plot_number samples from the trained model for image data
-    num_components = means.shape[0]
-    dim = means.shape[-1]
-    # sample from the multivariate normal distribution
-    comp_num = torch.randint(0, num_components, (1,sample_number)) #shape: [1, plot_number]
-    comp_num = comp_num.squeeze(0)  # shape: [plot_number]
-    samples = torch.empty(sample_number, dim, device=means.device)  # shape: [plot_number, d]
+    num_components, dim = means.shape
+    comp_num = torch.randint(0, num_components, (sample_number,), device=means.device)
+    samples = torch.empty(sample_number, dim, device=means.device)
+
     unique_indices = comp_num.unique()
+
     for i in unique_indices:
         idx = (comp_num == i).nonzero(as_tuple=True)[0]
         n_i = idx.shape[0]
+        centers_i = means[i].unsqueeze(0).expand(n_i, -1)  # [n_i, dim]
 
-        centers_i = means[i].unsqueeze(0).expand(n_i, -1)  # [n_i, d]
+        # Get model output vectors (flattened Cholesky)
+        vectors = factornet(centers_i)  # [n_i, d*(d+1)//2]
 
-        # Get precision Cholesky factors L_i from factornet
-        L_i = factornet(centers_i)  # shape [n_i, d, d], lower-triangular
+        # Use your existing function to get precision matrix with stabilization
+        precision = vectors_to_precision(vectors, dim)  # [n_i, dim, dim]
 
-        # Sample standard normal noise
-        eps = torch.randn(n_i, dim, device=means.device)  # shape [n_i, d]
+        # Create multivariate normal with precision matrix
+        mvn = MultivariateNormal(loc=centers_i, precision_matrix=precision)
 
-        # Solve L_i^T y = eps for y
-        y = torch.linalg.solve_triangular(L_i.transpose(-2, -1), eps.unsqueeze(-1), upper=True).squeeze(-1)
+        # Sample from this distribution
+        samples_i = mvn.rsample()  # [n_i, dim]
 
-        # Solve L_i x = y for x
-        x = torch.linalg.solve_triangular(L_i, y.unsqueeze(-1), upper=False).squeeze(-1)
+        samples[idx] = samples_i
 
-        # Sample = center + x
-        samples[idx] = centers_i + x
     return samples
 
 
@@ -665,7 +663,7 @@ def plot_images_with_model(factornet, means, plot_number = 10, save_path=None):
         axs[i].imshow(img)
         axs[i].axis('off')
     if save_path is not None:
-        save_path = save_path + 'model_samples.png'
+        save_path = save_path + '_sampled_images.png'
         plt.savefig(save_path)
     plt.close(fig)
     return None

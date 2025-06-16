@@ -29,7 +29,8 @@ from torch.cuda.amp import GradScaler, autocast
 from torch.distributions.multivariate_normal import MultivariateNormal
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
-
+import torch._dynamo
+#torch._dynamo.config.suppress_errors = True
 # ------------------- PROJECT MODULES -------------------
 from WPO_SGM import toy_data
 from WPO_SGM import functions_WPO_SGM as LearnCholesky
@@ -57,13 +58,13 @@ parser = argparse.ArgumentParser(' ')
 parser.add_argument('--data', choices=['swissroll', '8gaussians', 'pinwheel', 'circles', 'moons', '2spirals', 'checkerboard', 'rings','swissroll_6D_xy1', 'cifar10'], type = str,default = 'cifar10')
 parser.add_argument('--depth',help = 'number of hidden layers of score network',type =int, default = 5)
 parser.add_argument('--hiddenunits',help = 'number of nodes per hidden layer', type = int, default = 64)
-parser.add_argument('--niters',type = int, default = 50000)
-parser.add_argument('--batch_size', type = int,default = 2)
+parser.add_argument('--niters',type = int, default = 20)
+parser.add_argument('--batch_size', type = int,default = 8)
 parser.add_argument('--lr',type = float, default = 2e-3) 
 parser.add_argument('--save',type = str,default = 'cifar10_experiments/')
-parser.add_argument('--train_kernel_size',type = int, default = 1000)
-parser.add_argument('--train_samples_size',type = int, default = 50000)
-parser.add_argument('--test_samples_size',type = int, default = 500)
+parser.add_argument('--train_kernel_size',type = int, default = 50)
+parser.add_argument('--train_samples_size',type = int, default = 500)
+parser.add_argument('--test_samples_size',type = int, default = 5)
 parser.add_argument('--load_model_path', type = str, default = None)
 parser.add_argument('--load_centers_path', type = str, default = None)
 args = parser.parse_args('')
@@ -124,21 +125,34 @@ def load_model(model, centers, load_model_path, load_centers_path):
     """
     if load_model_path is not None and os.path.exists(load_model_path):
         state_dict = torch.load(load_model_path, map_location=device)
-        # If the checkpoint has "module." prefixes but you're NOT using DataParallel, strip them
+        
+        # Strip "module." prefix if present
         if any(k.startswith("module.") for k in state_dict.keys()):
             from collections import OrderedDict
             new_state_dict = OrderedDict()
             for k, v in state_dict.items():
                 new_state_dict[k.replace("module.", "")] = v
             state_dict = new_state_dict
+        
+        # Strip "_orig_mod." prefix if present
+        if any(k.startswith("_orig_mod.") for k in state_dict.keys()):
+            from collections import OrderedDict
+            new_state_dict = OrderedDict()
+            for k, v in state_dict.items():
+                new_state_dict[k.replace("_orig_mod.", "")] = v
+            state_dict = new_state_dict
+        
         model.load_state_dict(state_dict)
-        logging.info(f"Loaded model weights from {args.load_path}")
+        logging.info(f"Loaded model weights from {load_model_path}")
+    
     if load_centers_path is not None and os.path.exists(load_centers_path):
         centers = torch.load(load_centers_path, map_location=device)
         logging.info(f"Loaded centers from {load_centers_path}")
     else:
         print(f"No model loaded. Path does not exist: {load_model_path}")
+    
     return model, centers
+
     
 #-----------------------  HELPER FUNCTIONS -------------------
 # Define a compiled function that takes factornet, samples, centers as inputs
@@ -198,7 +212,7 @@ def save_training_slice_log(iter_time, loss_time, epoch, max_mem, loss_value, sa
         logging.info(f"Training started for epoch {epoch} / {epochs}")
         logging.info(
         f"Step {epoch:04d} | Iter Time: {iter_time:.4f}s | "
-        f"Loss Time: {loss_time:.4f}s | Loss: {loss_value.item():.6f} | "
+        f"Loss Time: {loss_time:.4f}s | Loss: {loss_value:.6f} | "
         f"Max Mem: {max_mem:.2f} MB"
         )   
 
@@ -212,6 +226,7 @@ logging.basicConfig(
     format='%(asctime)s - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
+logging.info(f"---------------------------------------------------------------------------------------------")
 
 #######################
 # Construct the model
@@ -225,9 +240,10 @@ centers = torch.tensor(
 )
 # Load model and centers if specified
 if load_model_path or load_centers_path:
+    print("loading model")
     factornet, centers = load_model(factornet, centers, load_model_path, load_centers_path)
 factornet = nn.DataParallel(factornet, device_ids=devices) # Wrap model in DataParallel, must be done after loading the model
-factornet = torch.compile(factornet, mode="reduce-overhead") # must be compiled after DataParallel
+#factornet = torch.compile(factornet, mode="reduce-overhead") # must be compiled after DataParallel
 
 #------------------------ Initialize the optimizer -------------------
 lr = args.lr
@@ -248,7 +264,7 @@ del p_samples
 ###########################
 gc.collect()
 torch.cuda.empty_cache()
-scaler = torch.amp.GradScaler('cuda')  #mixed precision gradient scaler
+scaler = torch.amp.GradScaler(enabled=False)  #mixed precision gradient scaler
 compiled_opt_check = torch.compile(opt_check) # Compile the optimization function
 
 for step in trange(epochs, desc="Training"):
@@ -271,7 +287,7 @@ for step in trange(epochs, desc="Training"):
         loss0 = evaluate_model(factornet, centers, test_samples_size)
         loss_end = time.time()
         loss_time = loss_end - loss_start
-        save_training_slice_cov(factornet, centers, step, lr, batch_size, loss0, save_directory)
+        save_training_slice_cov(factornet, centers, step, lr, batch_size, save_directory)
         save_training_slice_log(iter_time, loss_time, step, max_mem, loss0, save_directory)
 
     if step < epochs - 1:
@@ -287,11 +303,11 @@ gc.collect()
 torch.cuda.empty_cache()
 
 loss0 = evaluate_model(factornet, centers, test_samples_size)    
-save_training_slice_cov(factornet, centers, step, lr, batch_size, loss0, save_directory)
+save_training_slice_cov(factornet, centers, step, lr, batch_size, save_directory)
 formatted_loss = f'{loss0:.3e}'  # Format the average with up to 1e-3 precision
 logging.info(f'After train, Average total_loss: {formatted_loss}')
 
 #---------------------------- Sample and save -------------------
 with torch.no_grad():
-    LearnCholesky.plot_images_with_model(factornet, centers, plot_number=10, save=filename_final + '_sampled_images.png')
+    LearnCholesky.plot_images_with_model(factornet, centers, plot_number=10, save_path=filename_final)
     logging.info(f'Sampled images saved to {filename_final}_sampled_images.png')
