@@ -18,7 +18,10 @@ from memory_profiler import profile
 import numpy as np
 import pandas as pd
 from pandas.plotting import scatter_matrix as pdsm
+import matplotlib
+matplotlib.use('Agg')  # ✅ This is correct
 import matplotlib.pyplot as plt
+
 
 # ------------------- PYTORCH -------------------
 import torch
@@ -33,7 +36,7 @@ import torch._dynamo
 torch._dynamo.config.suppress_errors = True
 # ------------------- PROJECT MODULES -------------------
 from WPO_SGM import toy_data
-from WPO_SGM import functions_WPO_SGM as LearnCholesky
+from WPO_SGM import functions_WPO_SGM_ddp as LearnCholesky
 
 
 def setup_ddp(rank, world_size):
@@ -152,17 +155,34 @@ def evaluate_model(factornet, kernel_centers, num_test_sample, dataset, device):
         average_total_loss = total_loss_sum / 10
     return average_total_loss
 
-def opt_check(factornet, samples, centers, optimizer):
+def opt_check(factornet, samples, centers, optimizer, scaler):
     '''
-    Optimization function that computes the loss and performs backpropagation using mixed precision
+    Optimization function that computes the loss and performs backpropagation using mixed precision.
+    Adds NaN-checking and gradient clipping (recommended for DDP).
     '''
     optimizer.zero_grad(set_to_none=True)
-    loss = LearnCholesky.score_implicit_matching(factornet, samples, centers)
-    #scaler.scale(loss).backward()
-    #scaler.step(optimizer)
-    #scaler.update()
-    loss.backward()
-    optimizer.step()
+
+    #loss = LearnCholesky.score_implicit_matching(factornet, samples, centers)
+    loss = LearnCholesky.compute_score_with_ddp_safety(
+    factornet, samples, centers,
+    batch_chunk_size=32,  # Adjust based on your GPU memory
+    component_chunk_size=8,
+    use_amp=True
+    )
+    # Check for NaNs before backward
+    if not torch.isfinite(loss):
+        print(f"[RANK {dist.get_rank()}] ❌ Non-finite loss: {loss.item()}")
+        return loss  # Optionally: raise or skip
+
+    scaler.scale(loss).backward()
+
+    # Unscale and clip to avoid gradient explosions
+    scaler.unscale_(optimizer)
+    torch.nn.utils.clip_grad_norm_(factornet.parameters(), max_norm=1.0)
+
+    scaler.step(optimizer)
+    scaler.update()
+
     return loss
 
 #----------------------- SAVE FUNCTIONS -------------------
@@ -289,10 +309,14 @@ def main_worker(rank, world_size, args):
     
     # Wrap model in DDP
     factornet = DDP(factornet, device_ids=[rank])
-
+    factornet = torch.compile(factornet, mode="max-autotune")
+    scaler = GradScaler()
     #------------------------ Initialize the optimizer -------------------
     optimizer = optim.Adam(factornet.parameters(), lr=lr)
-
+    # ---------------- Setup per-rank RNG ----------------
+    global_seed = 1337  # Or from args/config
+    local_seed = global_seed + rank
+    rng = torch.Generator(device=device).manual_seed(local_seed)
     # Generate training samples (each process gets the same data for simplicity)
     p_samples = toy_data.inf_train_gen(dataset, batch_size=train_samples_size)
     training_samples = torch.tensor(p_samples, dtype=torch.float32, device=device)
@@ -328,10 +352,16 @@ def main_worker(rank, world_size, args):
 
     for step in progress_bar:
         torch.cuda.reset_peak_memory_stats() #reset peak memory stats for the current device
-        randind = torch.randint(0, train_samples_size, [batch_size,])
-        samples = training_samples[randind, :]
+        # Sample different batch per rank using seeded generator
+        randind = torch.randint(0, train_samples_size, (batch_size,), generator=rng, device=device)
+        samples = training_samples[randind]
+        #randind = torch.randint(0, train_samples_size, [batch_size,])
+        #samples = training_samples[randind, :]
         iter_start = time.time()
-        loss = compiled_opt_check(factornet, samples, centers, optimizer)
+        loss = compiled_opt_check(factornet, samples, centers, optimizer, scaler)
+        if not torch.isfinite(loss):
+            print(f"Rank {rank} encountered NaN loss!")
+            continue
         loss_value = loss.item()
         iter_end = time.time()
         iter_time = iter_end - iter_start
