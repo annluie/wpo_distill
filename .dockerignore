@@ -11,7 +11,7 @@ __pycache__/
 .venv/
 checkpoints/
 data/
-
+cifar10_experiments/
 # Ignore Git files
 .git
 .gitignore
