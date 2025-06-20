@@ -30,7 +30,7 @@ from torch.distributions.multivariate_normal import MultivariateNormal
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 import torch._dynamo
-#torch._dynamo.config.suppress_errors = True
+torch._dynamo.config.suppress_errors = True
 # ------------------- PROJECT MODULES -------------------
 from WPO_SGM import toy_data
 from WPO_SGM import functions_WPO_SGM as LearnCholesky
@@ -144,7 +144,7 @@ def load_model(model, centers, load_model_path, load_centers_path):
         
         model.load_state_dict(state_dict)
         logging.info(f"Loaded model weights from {load_model_path}")
-
+    
     if load_centers_path is not None and os.path.exists(load_centers_path):
         centers = torch.load(load_centers_path, map_location=device)
         logging.info(f"Loaded centers from {load_centers_path}")
@@ -168,7 +168,8 @@ def evaluate_model(factornet, kernel_centers, num_test_sample):
         for i in range(10):
             p_samples = toy_data.inf_train_gen(dataset,batch_size = num_test_sample)
             testing_samples = torch.as_tensor(p_samples, dtype=torch.float32, device=device)
-            total_loss = compiled_score(factornet, testing_samples, kernel_centers)
+            #total_loss = compiled_score(factornet, testing_samples, kernel_centers)
+            total_loss = LearnCholesky.score_implicit_matching(factornet, testing_samples, kernel_centers)
             total_loss_sum += total_loss.item()
              # Free up memory
             del p_samples, testing_samples, total_loss
@@ -177,15 +178,18 @@ def evaluate_model(factornet, kernel_centers, num_test_sample):
         average_total_loss = total_loss_sum / 10
     return average_total_loss
 
-def opt_check(factornet, samples, centers, optimizer, scaler):
+def opt_check(factornet, samples, centers, optimizer):
     '''
     Optimization function that computes the loss and performs backpropagation using mixed precision
     '''
     optimizer.zero_grad(set_to_none=True)
     loss = LearnCholesky.score_implicit_matching(factornet, samples, centers)
-    scaler.scale(loss).backward()
-    scaler.step(optimizer)
-    scaler.update()
+    #scaler.scale(loss).backward()
+    #scaler.step(optimizer)
+    #scaler.update()
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(factornet.parameters(), max_norm=1.0) #gradient clipping
+    optimizer.step()
     return loss
 
 #----------------------- SAVE FUNCTIONS -------------------
@@ -256,6 +260,7 @@ centers = torch.tensor(
     dtype=torch.float32,
     device=device
 )
+#factornet = nn.DataParallel(factornet, device_ids=devices)
 # Load model and centers if specified
 if load_model_path or load_centers_path:
     print("loading model")
@@ -266,12 +271,21 @@ if load_model_path or load_centers_path:
     save_directory = new_dir  # ✅ Set after creation
     factornet, centers = load_model(factornet, centers, load_model_path, load_centers_path)
 factornet = nn.DataParallel(factornet, device_ids=devices) # Wrap model in DataParallel, must be done after loading the model
-#factornet = torch.compile(factornet, mode="reduce-overhead") # must be compiled after DataParallel
+#factornet = torch.compile(factornet, mode="max-autotune") # must be compiled after DataParallel
 
 #------------------------ Initialize the optimizer -------------------
 lr = args.lr
 optimizer = optim.Adam(factornet.parameters(), lr=args.lr)
-
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau( #learning rate scheduler
+    optimizer,
+    mode='min',
+    factor=0.5,
+    patience=5,
+    threshold=1e-4,
+    cooldown=2,
+    min_lr=1e-7,
+    verbose=True
+)
 p_samples = toy_data.inf_train_gen(dataset,batch_size = train_samples_size)
 training_samples = torch.tensor(p_samples, dtype=torch.float32, device=device)
 
@@ -284,6 +298,7 @@ subfolder = os.path.join(
             f"lr{lr}"
         )
 os.makedirs(subfolder, exist_ok=True)
+#centers = centers.to('cpu')
 filename_final = os.path.join(subfolder, 'centers.pt')
 torch.save(centers, filename_final) #save the centers (we fix them in the beginning)
 del p_samples
@@ -293,32 +308,56 @@ del p_samples
 ###########################
 gc.collect()
 torch.cuda.empty_cache()
-scaler = torch.amp.GradScaler(enabled=False)  #mixed precision gradient scaler
-compiled_opt_check = torch.compile(opt_check) # Compile the optimization function
+#scaler = torch.amp.GradScaler(enabled=False)  #mixed precision gradient scaler
+compiled_opt_check = opt_check # compile the optimization function
 
 for step in trange(epochs, desc="Training"):
     torch.cuda.reset_peak_memory_stats() #reset peak memory stats for the current device
     randind = torch.randint(0, train_samples_size, [batch_size,])
     samples = training_samples[randind, :]
     iter_start = time.time()
-    loss = compiled_opt_check(factornet, samples, centers, optimizer, scaler)
+    # with torch.autograd.detect_anomaly():
+    loss = compiled_opt_check(factornet, samples, centers, optimizer)
     loss_value = loss.item()
+    if torch.isnan(loss) or torch.isinf(loss):
+        print(f"Invalid loss (NaN or Inf) at step {step}. Exiting.")
+        sys.exit(1)
     iter_end = time.time()
     iter_time = iter_end - iter_start
     max_mem = torch.cuda.max_memory_allocated() / 2**30  # in GiB
     print(f"Peak memory usage: {max_mem} GiB")
-    if step % 4000 == 0:
+    if step % 100 == 0:
         print(f"Step {step} started")
         print(f'Step: {step}, Loss value: {loss_value:.3e}')
-    
-    if step % 5000 == 0:
+        with open(os.path.join(subfolder, "loss_log.csv"), "a") as f:
+            f.write(f"{step},{loss_value}\n")
+    if step % 2000 == 0:
         loss_start = time.time()
         loss0 = evaluate_model(factornet, centers, test_samples_size)
         loss_end = time.time()
         loss_time = loss_end - loss_start
+        if not torch.isnan(loss0) and not torch.isinf(loss0):
+            # Get old LR before stepping scheduler
+            old_lrs = [group['lr'] for group in optimizer.param_groups]
+        
+            scheduler.step(loss0)
+
+            # Get new LR after stepping scheduler
+            new_lrs = [group['lr'] for group in optimizer.param_groups]
+
+            # Check if any LR changed
+            for i, (old_lr, new_lr) in enumerate(zip(old_lrs, new_lrs)):
+                if old_lr != new_lr:
+                    logging.info(f"LR changed for param group {i} from {old_lr:.2e} to {new_lr:.2e} at step {step}")
+        else:
+            print("⚠️ Warning: Skipping LR scheduler step due to invalid val_loss:", loss0)
         save_training_slice_cov(factornet, centers, step, lr, batch_size, save_directory)
         save_training_slice_log(iter_time, loss_time, step, max_mem, loss0, save_directory)
-
+        # Sample and save generated images at intermediate steps
+        with torch.no_grad():
+            filename_step_sample = os.path.join(subfolder, f"step{step:05d}")
+            LearnCholesky.plot_images_with_model(factornet, centers, plot_number=10, save_path=filename_step_sample)
+            logging.info(f"Saved samples at step {step} to {filename_step_sample}")
     if step < epochs - 1:
         del samples
         gc.collect()
@@ -338,5 +377,5 @@ logging.info(f'After train, Average total_loss: {formatted_loss}')
 
 #---------------------------- Sample and save -------------------
 with torch.no_grad():
-    LearnCholesky.plot_images_with_model(factornet, centers, plot_number=10, save_path=filename_final)
-    logging.info(f'Sampled images saved to {filename_final}_sampled_images.png')
+    LearnCholesky.plot_images_with_model(factornet, centers, plot_number=10, save_path=subfolder)
+    logging.info(f'Sampled images saved to {filename_final}')
