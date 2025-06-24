@@ -131,11 +131,17 @@ def inf_train_gen(data, rng=None, batch_size=200):
         z3 =  data[:,0] - 2*data[:,1] + rng.randn(batch_size) * 0.1
         return np.stack((data[:,0], data[:,1], z1, z2, z3, z4), 1)
     elif data =='cifar10':
-        # Basic transform: convert to tensor and normalize to [-1, 1]
+        '''      # Basic transform: convert to tensor and normalize to [-1, 1]
         transform = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize((0.5,), (0.5,)) # Normalize from [0,1] to [-1,1]
         ])  
+        '''
+        #normalize to have mean 0 and std 1 for each channel
+        transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)) # Normalize to mean=0, std=1
+        ])
         b = batch_size
         train_dataset = datasets.CIFAR10(root='./data', train=True, download=True, transform=transform)
         train_loader = DataLoader(train_dataset, batch_size=b, shuffle=True, num_workers=4)

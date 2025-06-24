@@ -14,7 +14,7 @@ import torch.nn.functional as F
 import torch.linalg as LA
 #import gc
 
-'''
+
 ## vector to precision matrix function
 def vectors_to_precision(vectors,dim):
     """
@@ -34,13 +34,13 @@ def vectors_to_precision(vectors,dim):
     L[:, indices[0], indices[1]] = vectors.squeeze(1)
     
     # Construct the precision matrices using Cholesky factorization
-    C = torch.matmul(L, L.transpose(1, 2)) + 0.01 * torch.eye(dim).to(vectors.device) # (add identity matrix to maintain positive definiteness)
+    C = torch.matmul(L, L.transpose(1, 2)) + 0.1 * torch.eye(dim).to(vectors.device) # (add identity matrix to maintain positive definiteness)
     
     return C
-'''
+
 import torch
 import torch.nn.functional as F
-
+'''
 def vectors_to_precision(vectors, dim, eps=1e-2):
     """
     Maps an array of 1xdim vectors into Cholesky factors and returns an array of precision matrices,
@@ -74,7 +74,6 @@ def vectors_to_precision(vectors, dim, eps=1e-2):
 
     return C
 
-'''
 def vectors_to_precision_chunked(vectors, dim, chunk_size=2):
     batch_size = vectors.shape[0]
     precisions = []
@@ -98,7 +97,8 @@ def vectors_to_precision_chunked(vectors, dim, chunk_size=2):
 
     return torch.cat(precisions, dim=0)
 '''
-'''
+
+"""
 def vectors_to_precision_chunked(vectors, dim, chunk_size=2, reg=0.01):
     batch_size = vectors.shape[0]
     dtype = torch.float32
@@ -120,7 +120,7 @@ def vectors_to_precision_chunked(vectors, dim, chunk_size=2, reg=0.01):
         precisions.append(C_chunk)
 
     return torch.cat(precisions, dim=0)
-    '''
+
 def vectors_to_precision_chunked(vectors, dim, chunk_size=2, reg=0.01):
     batch_size = vectors.shape[0]
     dtype = torch.float32
@@ -146,7 +146,7 @@ def vectors_to_precision_chunked(vectors, dim, chunk_size=2, reg=0.01):
         precisions.append(C_chunk)
 
     return torch.cat(precisions, dim=0)
-
+"""
 #----------------------------------------------#
 #### Mixture of Gaussians functions ####
 #----------------------------------------------#
@@ -345,39 +345,71 @@ def laplacian_mog_density_div_density(x, means, precisions):
 #----------------------------------------------#
 
 #@profile
-"""
 def laplacian_mog_density_div_density_chunked(x, means, precisions, chunk_size=16):
     results = []
     for i in range(0, x.size(0), chunk_size):
-        x_chunk = x[i:i+chunk_size].detach().clone().requires_grad_(x.requires_grad)
+        x_chunk = x[i:i+chunk_size] 
         result = laplacian_mog_density_div_density(x_chunk, means, precisions)
         results.append(result.detach() if not result.requires_grad else result)
         del result, x_chunk
-        gc.collect()
+        #gc.collect()
         torch.cuda.empty_cache()
     return torch.cat(results, dim=0)
-"""
-def laplacian_mog_density_div_density_chunked(x, means, precisions, chunk_size=2):
-    total_result = torch.zeros(x.shape[0], device=x.device, dtype=x.dtype)
 
+def laplacian_mog_density_div_density_chunked_components(x, means, precisions, chunk_size=32):
+    batch_size, dim = x.shape
     num_components = means.shape[0]
 
+    # Accumulate partial results
+    all_log_probs = []
+    all_squared_linear = []
+    all_trace_precision = []
+
+    # Compute chunked contributions
     for start in range(0, num_components, chunk_size):
         end = min(start + chunk_size, num_components)
 
-        means_chunk = means[start:end]
-        precisions_chunk = precisions[start:end]
+        means_chunk = means[start:end]  # (chunk_size, dim)
+        precisions_chunk = precisions[start:end]  # (chunk_size, dim, dim)
 
-        # Compute partial contribution from the chunk
-        result = laplacian_mog_density_div_density(x, means_chunk, precisions_chunk)
+        x_expanded = x.unsqueeze(1)  # (B, 1, D)
+        x_mean = x_expanded - means_chunk  # (B, chunk_size, D)
 
-        # Accumulate without detach
-        total_result += result
-        
-        # No explicit deletes or empty cache here
-        del result
+        # Compute log probs using Mahalanobis term: -0.5 * x^T P x + const
+        cov_term = torch.einsum("kij,bkj->bki", precisions_chunk, x_mean)  # (B, chunk_size, D)
+        squared_linear = torch.sum(cov_term * cov_term, dim=-1)  # (B, chunk_size)
+
+        # log det precision = -log det cov = + log det precision
+        log_det = torch.logdet(precisions_chunk)  # (chunk_size,)
+        log_det = log_det.unsqueeze(0).expand(batch_size, -1)  # (B, chunk_size)
+
+        log_probs_chunk = 0.5 * log_det - 0.5 * squared_linear - 0.5 * dim * torch.log(torch.tensor(2 * torch.pi, device=x.device, dtype=x.dtype))
+
+        # trace of precision
+        trace_chunk = torch.diagonal(precisions_chunk, dim1=-2, dim2=-1).sum(dim=-1)  # (chunk_size,)
+        trace_chunk = trace_chunk.unsqueeze(0).expand(batch_size, -1)  # (B, chunk_size)
+
+        all_log_probs.append(log_probs_chunk)
+        all_squared_linear.append(squared_linear)
+        all_trace_precision.append(trace_chunk)
+
+        # Optional memory cleanup
+        del x_mean, cov_term, squared_linear, trace_chunk, log_probs_chunk
         torch.cuda.empty_cache()
-    return total_result
+
+    # Concatenate across component dimension
+    log_probs = torch.cat(all_log_probs, dim=1)  # (B, K)
+    squared_linear = torch.cat(all_squared_linear, dim=1)  # (B, K)
+    trace_precision = torch.cat(all_trace_precision, dim=1)  # (B, K)
+
+    # Compute softmax over full set of components
+    softmax_probs = torch.softmax(log_probs, dim=1)  # (B, K)
+
+    laplacian_component = softmax_probs * (squared_linear - trace_precision)  # (B, K)
+    laplacian_over_density = laplacian_component.sum(dim=1)  # (B,)
+
+    return laplacian_over_density
+
 
 #@profile
 def grad_log_mog_density_chunked(x, means, precisions, chunk_size=8):
@@ -425,28 +457,6 @@ def grad_log_mog_density_double_chunked(x, means, precisions, batch_chunk_size=1
         torch.cuda.empty_cache()
     return torch.cat(outputs, dim=0)
 """
-def grad_log_mog_density_double_chunked(x, means, precisions, batch_chunk_size=16, component_chunk_size=16):
-    total_result = []
-    for i in range(0, x.size(0), batch_chunk_size):
-        x_chunk = x[i:i+batch_chunk_size]
-        x_chunk.requires_grad_(True)
-        partial_result = torch.zeros_like(x_chunk)
-
-        for j in range(0, means.size(0), component_chunk_size):
-            result = grad_log_mog_density(
-                x_chunk,
-                means[j:j+component_chunk_size],
-                precisions[j:j+component_chunk_size]
-            )
-            partial_result = partial_result + result
-            del result
-            torch.cuda.empty_cache()
-
-        total_result.append(partial_result.detach())
-        del x_chunk, partial_result
-        torch.cuda.empty_cache()
-
-    return torch.cat(total_result, dim=0)
 
 #grad_eval_comp = torch.compile(grad_log_mog_density_double_chunked)
 #----------------------------------------------#
@@ -458,7 +468,8 @@ def score_implicit_matching(factornet, samples, centers):
     centers = centers.clone().detach().requires_grad_(True)
     factor_eval = checkpoint(factornet, centers, use_reentrant=False)
     #factor_eval = factornet(centers)
-    precisions = vectors_to_precision_chunked(factor_eval, dim, chunk_size=2)
+    #precisions = vectors_to_precision(factor_eval, dim, chunk_size=2)
+    precisions = vectors_to_precision(factor_eval, dim)
     #v_to_p_comp = torch.compile(vectors_to_precision_chunked)
     #precisions = v_to_p_comp(factor_eval, dim, chunk_size=2)
     #cond_numbers = LA.cond(precisions)  # condition number per matrix
@@ -472,7 +483,7 @@ def score_implicit_matching(factornet, samples, centers):
         #laplacian_over_density_comp = torch.compile(laplacian_mog_density_div_density)
         #laplacian_over_density = laplacian_over_density_comp(samples, centers, precisions)
     # Compute gradient in chunks
-    gradient_eval_log = grad_log_mog_density_double_chunked(samples, centers, precisions)
+    gradient_eval_log = grad_log_mog_density_chunked(samples, centers, precisions)
         #gradient_eval_log = grad_eval_comp(samples, centers, precisions)
     del precisions
     torch.cuda.empty_cache()
@@ -725,7 +736,11 @@ def plot_images(means, precisions, epoch = 0, plot_number = 10, save_path=None):
     samples = multivariate_normal.rsample()
     # transform images back to original data 
     samples = samples.view(-1, 3, 32, 32)
-    samples = samples * 0.5 + 0.5
+    #samples = samples * 0.5 + 0.5
+     #   Undo CIFAR-10 normalization
+    mean = torch.tensor([0.4914, 0.4822, 0.4465], device=samples.device).view(1, 3, 1, 1)
+    std = torch.tensor([0.2023, 0.1994, 0.2010], device=samples.device).view(1, 3, 1, 1)
+    samples = samples * std + mean
     fig, axs = plt.subplots(1, plot_number, figsize=(15, 2))
     for i in range(plot_number):
         img = samples[i].permute(1, 2, 0).cpu().numpy()  # change from [C, H, W] to [H, W, C]
@@ -761,3 +776,34 @@ def plot_images_with_model(factornet, means, plot_number = 10, save_path=None):
         plt.savefig(save_path)
     plt.close(fig)
     return None
+def denormalize_cifar10(tensor):
+    """
+    Denormalizes a batch of CIFAR-10 images from standardized (mean=0, std=1)
+    back to [0, 1] for visualization.
+    
+    Args:
+        tensor: (N, 3, 32, 32) tensor, normalized using CIFAR-10 mean/std
+
+    Returns:
+        Denormalized tensor (still in [0, 1] range)
+    """
+    mean = torch.tensor([0.4914, 0.4822, 0.4465], device=tensor.device).view(1, 3, 1, 1)
+    std = torch.tensor([0.2023, 0.1994, 0.2010], device=tensor.device).view(1, 3, 1, 1)
+    return tensor * std + mean
+
+import torchvision.utils as vutils
+
+def plot_and_save_centers(centers, save_path, nrow=10):
+    centers = centers.view(-1, 3, 32, 32)  # reshape
+    centers = denormalize_cifar10(centers).clamp(0, 1)  # denormalize and clip to [0, 1]
+
+    grid = vutils.make_grid(centers, nrow=nrow, padding=2)
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    vutils.save_image(grid, save_path)
+    print(f"Saved centers to {save_path}")
+
+    # Optional preview
+    plt.figure(figsize=(nrow, nrow))
+    plt.axis("off")
+    plt.imshow(grid.permute(1, 2, 0).cpu().numpy())
+    plt.show()

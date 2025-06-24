@@ -33,7 +33,8 @@ import torch._dynamo
 torch._dynamo.config.suppress_errors = True
 # ------------------- PROJECT MODULES -------------------
 from WPO_SGM import toy_data
-from WPO_SGM import functions_WPO_SGM as LearnCholesky
+#from WPO_SGM import functions_WPO_SGM as LearnCholesky
+from WPO_SGM import function_cpu as LearnCholesky
 
 
 ###################
@@ -208,7 +209,7 @@ def save_training_slice_cov(factornet, means, epoch, lr, batch_size, save):
             f"test_size{test_samples_size}",
             f"batch_size{batch_size}",
             f"centers{train_kernel_size}",
-            f"lr{lr}"
+            f"lr{lr}_hu{hidden_units}"
         )
         os.makedirs(subfolder, exist_ok=True)
 
@@ -286,6 +287,7 @@ scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau( #learning rate scheduler
     min_lr=1e-7,
     verbose=True
 )
+
 p_samples = toy_data.inf_train_gen(dataset,batch_size = train_samples_size)
 training_samples = torch.tensor(p_samples, dtype=torch.float32, device=device)
 
@@ -295,12 +297,16 @@ subfolder = os.path.join(
             f"test_size{test_samples_size}",
             f"batch_size{batch_size}",
             f"centers{train_kernel_size}",
-            f"lr{lr}"
+            f"lr{lr}_hu{hidden_units}"
         )
 os.makedirs(subfolder, exist_ok=True)
 #centers = centers.to('cpu')
 filename_final = os.path.join(subfolder, 'centers.pt')
+#generate centers as subset of training samples
+centers = training_samples[torch.randperm(training_samples.size(0))[:train_kernel_size]]
 torch.save(centers, filename_final) #save the centers (we fix them in the beginning)
+filename_final = os.path.join(subfolder, 'centers.png')
+LearnCholesky.plot_and_save_centers(centers, filename_final)
 del p_samples
 
 ###########################
@@ -331,33 +337,35 @@ for step in trange(epochs, desc="Training"):
         print(f'Step: {step}, Loss value: {loss_value:.3e}')
         with open(os.path.join(subfolder, "loss_log.csv"), "a") as f:
             f.write(f"{step},{loss_value}\n")
-    if step % 2000 == 0:
+    if step % 200 == 0:
         loss_start = time.time()
         loss0 = evaluate_model(factornet, centers, test_samples_size)
         loss_end = time.time()
         loss_time = loss_end - loss_start
-        if not torch.isnan(loss0) and not torch.isinf(loss0):
-            # Get old LR before stepping scheduler
-            old_lrs = [group['lr'] for group in optimizer.param_groups]
-        
-            scheduler.step(loss0)
-
-            # Get new LR after stepping scheduler
-            new_lrs = [group['lr'] for group in optimizer.param_groups]
-
-            # Check if any LR changed
-            for i, (old_lr, new_lr) in enumerate(zip(old_lrs, new_lrs)):
-                if old_lr != new_lr:
-                    logging.info(f"LR changed for param group {i} from {old_lr:.2e} to {new_lr:.2e} at step {step}")
-        else:
-            print("⚠️ Warning: Skipping LR scheduler step due to invalid val_loss:", loss0)
         save_training_slice_cov(factornet, centers, step, lr, batch_size, save_directory)
         save_training_slice_log(iter_time, loss_time, step, max_mem, loss0, save_directory)
+        if not torch.isnan(loss0) and not torch.isinf(loss0):
+                # Get old LR before stepping scheduler
+                old_lrs = [group['lr'] for group in optimizer.param_groups]
+                scheduler.step(loss0)
+
+                # Get new LR after stepping scheduler
+                new_lrs = [group['lr'] for group in optimizer.param_groups]
+
+                # Check if any LR changed
+        for i, (old_lr, new_lr) in enumerate(zip(old_lrs, new_lrs)):
+            if old_lr != new_lr:
+                logging.info(f"LR changed for param group {i} from {old_lr:.2e} to {new_lr:.2e} at step {step}")
+            else:
+                print("⚠️ Warning: Skipping LR scheduler step due to invalid val_loss:", loss0)
         # Sample and save generated images at intermediate steps
         with torch.no_grad():
             filename_step_sample = os.path.join(subfolder, f"step{step:05d}")
             LearnCholesky.plot_images_with_model(factornet, centers, plot_number=10, save_path=filename_step_sample)
             logging.info(f"Saved samples at step {step} to {filename_step_sample}")
+            generated = LearnCholesky.sample_from_model(factornet, training_samples, sample_number=10)
+            l2 = torch.mean((generated - training_samples[:10])**2).item()
+            print(f"[Step {step}] L2 to training data: {l2:.2f}")
     if step < epochs - 1:
         del samples
         gc.collect()
@@ -378,4 +386,4 @@ logging.info(f'After train, Average total_loss: {formatted_loss}')
 #---------------------------- Sample and save -------------------
 with torch.no_grad():
     LearnCholesky.plot_images_with_model(factornet, centers, plot_number=10, save_path=subfolder)
-    logging.info(f'Sampled images saved to {filename_final}')
+    logging.info(f'Sampled images saved to {filename_final}_sampled_images.png')
