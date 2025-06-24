@@ -35,5 +35,4 @@ RUN pip install --no-cache-dir -r requirements.txt && \
 # Optional: expose port if it's a web app
 # EXPOSE 8080
 
-ENTRYPOINT ["python"]
-CMD ["train_wpo_sgm.py"]
+ENTRYPOINT ["python", "train_wpo_sgm.py"]
