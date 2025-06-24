@@ -7,4 +7,5 @@ torchvision
 tdqm
 argparse
 memory_profiler 
+google-cloud-storage
 

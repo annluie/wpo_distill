@@ -10,15 +10,63 @@ Then, run using the number of gpus you have: docker run --gpus all \
   --data cifar10 \
   --depth 5 \
   --hiddenunits 64 \
-  --niters 50000 \
+  --niters 10000 \
   --batch_size 2 \
   --lr 0.002 \
   --save cifar10_experiments/ \
-  --train_kernel_size 1000 \
-  --train_samples_size 50000 \
-  --test_samples_size 500 \
+  --train_kernel_size 100 \
+  --train_samples_size 500 \
+  --test_samples_size 5 \
   --load_model_path None \
   --load_centers_path None
 
-
+--data cifar10 
+  --depth 5 
+  --hiddenunits 64 \
+  --niters 10000 \
+  --batch_size 2 \
+  --lr 0.002 \
+  --save cifar10_experiments/ \
+  --train_kernel_size 100 \
+  --train_samples_size 500 \
+  --test_samples_size 5 \
+  --load_model_path None \
+  --load_centers_path None
    
+--data cifar10
+--depth 5
+--hiddenunits 64
+--niters 10000
+--batch_size 4
+--lr 0.002
+--save cifar10_experiments/
+--train_kernel_size 100
+--train_samples_size 500
+--test_samples_size 5
+--load_model_path None
+--load_centers_path None
+
+--data
+cifar10
+--depth
+5
+--hiddenunits
+64
+--niters
+10000
+--batch_size
+4
+--lr
+0.002
+--save
+cifar10_experiments/
+--train_kernel_size
+100
+--train_samples_size
+500
+--test_samples_size
+5
+--load_model_path
+None
+--load_centers_path
+None
