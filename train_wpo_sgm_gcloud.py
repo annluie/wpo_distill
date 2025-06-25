@@ -37,76 +37,6 @@ torch._dynamo.config.suppress_errors = True
 from WPO_SGM import toy_data
 from WPO_SGM import functions_WPO_SGM as LearnCholesky
 
-
-###################
-# setup
-###################
-# ------------------- CHECK GPUS -------------------
-# check how many GPUs are available
-if torch.cuda.is_available():
-    devices = list(range(torch.cuda.device_count()))
-    device = torch.device('cuda:0')
-    print(f"Using {len(devices)} GPUs with DataParallel: {devices}")
-else:
-    devices = ['cpu']
-    device = torch.device('cpu')
-#device = torch.device('cpu')
-
-# ------------------- SET PARAMETERS -------------------
-torch.set_float32_matmul_precision('high') # set precision for efficient matrix multiplication
-
-# setup argument parser
-parser = argparse.ArgumentParser()
-parser.add_argument('--data', choices=['swissroll', '8gaussians', 'pinwheel', 'circles', 'moons', '2spirals', 'checkerboard', 'rings','swissroll_6D_xy1', 'cifar10'], type = str,default = 'cifar10')
-parser.add_argument('--depth',help = 'number of hidden layers of score network',type =int, default = 5)
-parser.add_argument('--hiddenunits',help = 'number of nodes per hidden layer', type = int, default = 64)
-parser.add_argument('--niters',type = int, default = 20)
-parser.add_argument('--batch_size', type = int,default = 8)
-parser.add_argument('--lr',type = float, default = 2e-3) 
-parser.add_argument('--save',type = str,default = 'cifar10_experiments/')
-parser.add_argument('--train_kernel_size',type = int, default = 50)
-parser.add_argument('--train_samples_size',type = int, default = 500)
-parser.add_argument('--test_samples_size',type = int, default = 5)
-parser.add_argument('--load_model_path', type = str, default = None)
-parser.add_argument('--load_centers_path', type = str, default = None)
-args = parser.parse_args()
-
-# set parameters from args
-train_kernel_size = args.train_kernel_size
-train_samples_size = args.train_samples_size
-test_samples_size = args.test_samples_size
-dataset = args.data 
-epochs = args.niters
-batch_size = args.batch_size
-lr = args.lr
-hidden_units = args.hiddenunits
-depth = args.depth
-#save_directory = args.save + 'test'+'/'
-load_model_path = args.load_model_path
-load_centers_path = args.load_centers_path
-
-#-------------------- Initialize Data -------------------
-# check the dataset
-if dataset not in ['swissroll', '8gaussians', 'pinwheel', 'circles', 'moons', '2spirals', 'checkerboard', 'rings','swissroll_6D_xy1', 'cifar10']:
-    dataset = 'cifar10'
-means  = torch.tensor(toy_data.inf_train_gen(dataset, batch_size = train_kernel_size)).to(dtype = torch.float32)
-data_dim = means.shape[1]
-del means
-torch.cuda.empty_cache()
-
-#-------------------- Create Save Directory -------------------
-save_directory = os.environ.get("AIP_MODEL_DIR", args.save)
-print("Saving outputs to:", save_directory)
-# Create a temp directory for saving during training
-local_save_directory = tempfile.mkdtemp(prefix="training_temp_")
-print(f"Saving training data locally in {local_save_directory}")
-# Optional: if local fallback
-if not save_directory.startswith("gs://"): 
-    if not os.path.exists(save_directory):
-        os.makedirs(save_directory)
-    local_save_directory = save_directory  # Use the main save directory if it exists
-
-
 ###################
 # functions
 ###################
@@ -161,10 +91,11 @@ def load_model(model, centers, load_model_path, load_centers_path):
     
     return model, centers
 
+
     
 #-----------------------  HELPER FUNCTIONS -------------------
 # Define a compiled function that takes factornet, samples, centers as inputs
-compiled_score = torch.compile(LearnCholesky.score_implicit_matching)
+#compiled_score = torch.compile(LearnCholesky.score_implicit_matching)
 
 def evaluate_model(factornet, kernel_centers, num_test_sample): 
     '''
@@ -201,27 +132,39 @@ def opt_check(factornet, samples, centers, optimizer):
     return loss
 
 #----------------------- SAVE FUNCTIONS -------------------
-import os
-
-def save_training_slice_cov(factornet, means, epoch, lr, batch_size, save):
+def create_save_dir(save):
     '''
-    Save the training slice of the NN in parameter-based subfolders,
-    with epoch appended to the filename.
+    Create a subfolder to save all the outputs
     '''
     if save is not None:
-        # Create subfolders for all parameters except epoch
         subfolder = os.path.join(
             save,
             f"sample_size{train_samples_size}",
             f"test_size{test_samples_size}",
             f"batch_size{batch_size}",
             f"centers{train_kernel_size}",
-            f"lr{lr}"
+            f"lr{lr}_hu{hidden_units}"
         )
         os.makedirs(subfolder, exist_ok=True)
+    else:
+        subfolder = os.path.join(
+            f"sample_size{train_samples_size}",
+            f"test_size{test_samples_size}",
+            f"batch_size{batch_size}",
+            f"centers{train_kernel_size}",
+            f"lr{lr}_hu{hidden_units}"
+        )
+        os.makedirs(subfolder, exist_ok=True)
+    return subfolder
 
+def save_training_slice_cov(factornet, means, epoch, save):
+    '''
+    Save the training slice of the NN in parameter-based subfolders,
+    with epoch appended to the filename.
+    '''
+    if save is not None:
         # Create filename with epoch appended
-        filename = os.path.join(subfolder, f"epoch{epoch:04d}_factornet.pth")
+        filename = os.path.join(save, f"epoch{epoch:04d}_factornet.pth")
 
         # Save model weights
         state_dict = factornet.module.state_dict() if isinstance(factornet, nn.DataParallel) else factornet.state_dict()
@@ -246,17 +189,6 @@ def save_training_slice_log(iter_time, loss_time, epoch, max_mem, loss_value, sa
         f"Max Mem: {max_mem:.2f} MB"
         )   
 
-# Configure the logger
-log_filename = os.path.join(local_save_directory,
-                             f'sample_size{train_samples_size}_test_size{test_samples_size}_batch_size{batch_size}_centers{train_kernel_size}_lr{lr}_training.log'
-                             )
-logging.basicConfig(
-    filename=log_filename,
-    level=logging.INFO,
-    format='%(asctime)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
-logging.info(f"---------------------------------------------------------------------------------------------")
 # Function to upload a directory to Google Cloud Storage
 def upload_dir_to_gcs(local_dir, gcs_path):
     client = storage.Client()
@@ -273,6 +205,87 @@ def upload_dir_to_gcs(local_dir, gcs_path):
             blob = bucket.blob(gcs_file_path)
             blob.upload_from_filename(local_file)
             logging.info(f"Uploaded {local_file} to gs://{bucket_name}/{gcs_file_path}")
+
+
+###################
+# setup
+###################
+# ------------------- CHECK GPUS -------------------
+# check how many GPUs are available
+if torch.cuda.is_available():
+    devices = list(range(torch.cuda.device_count()))
+    device = torch.device('cuda:0')
+    print(f"Using {len(devices)} GPUs with DataParallel: {devices}")
+else:
+    devices = ['cpu']
+    device = torch.device('cpu')
+device = torch.device('cuda:0') #checking ram with gcloud
+
+# ------------------- SET PARAMETERS -------------------
+torch.set_float32_matmul_precision('high') # set precision for efficient matrix multiplication
+
+# setup argument parser
+parser = argparse.ArgumentParser()
+parser.add_argument('--data', choices=['swissroll', '8gaussians', 'pinwheel', 'circles', 'moons', '2spirals', 'checkerboard', 'rings','swissroll_6D_xy1', 'cifar10'], type = str,default = 'cifar10')
+parser.add_argument('--depth',help = 'number of hidden layers of score network',type =int, default = 5)
+parser.add_argument('--hiddenunits',help = 'number of nodes per hidden layer', type = int, default = 64)
+parser.add_argument('--niters',type = int, default = 20)
+parser.add_argument('--batch_size', type = int,default = 8)
+parser.add_argument('--lr',type = float, default = 2e-3) 
+parser.add_argument('--save',type = str,default = 'cifar10_experiments/')
+parser.add_argument('--train_kernel_size',type = int, default = 50)
+parser.add_argument('--train_samples_size',type = int, default = 500)
+parser.add_argument('--test_samples_size',type = int, default = 5)
+parser.add_argument('--load_model_path', type = str, default = None)
+parser.add_argument('--load_centers_path', type = str, default = None)
+args = parser.parse_args()
+
+# set parameters from args
+train_kernel_size = args.train_kernel_size
+train_samples_size = args.train_samples_size
+test_samples_size = args.test_samples_size
+dataset = args.data 
+epochs = args.niters
+batch_size = args.batch_size
+lr = args.lr
+hidden_units = args.hiddenunits
+depth = args.depth
+#save_directory = args.save + 'test'+'/'
+load_model_path = args.load_model_path
+load_centers_path = args.load_centers_path
+
+#-------------------- Initialize Data -------------------
+# check the dataset
+if dataset not in ['swissroll', '8gaussians', 'pinwheel', 'circles', 'moons', '2spirals', 'checkerboard', 'rings','swissroll_6D_xy1', 'cifar10']:
+    dataset = 'cifar10'
+means  = torch.tensor(toy_data.inf_train_gen(dataset, batch_size = train_kernel_size)).to(dtype = torch.float32)
+data_dim = means.shape[1]
+del means
+torch.cuda.empty_cache()
+
+#-------------------- Create Save Directory -------------------
+save_directory = os.environ.get("AIP_MODEL_DIR", args.save)
+print("Saving outputs to:", save_directory)
+# Create a temp directory for saving during training
+local_save_directory = tempfile.mkdtemp(prefix="training_temp_")
+print(f"Saving training data locally in {local_save_directory}")
+# Optional: if local fallback
+if not save_directory.startswith("gs://"): 
+    save_directory = create_save_dir(save_directory)
+    local_save_directory = save_directory  # Use the main save directory if it exists
+
+log_filename = os.path.join(local_save_directory,
+                             f'sample_size{train_samples_size}_test_size{test_samples_size}_batch_size{batch_size}_centers{train_kernel_size}_lr{lr}__hu{hidden_units}training.log'
+                            )
+os.makedirs(os.path.dirname(log_filename), exist_ok=True)
+logging.basicConfig(
+    filename=log_filename,
+    level=logging.INFO,
+    format='%(asctime)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+    force=True
+)
+logging.info(f"---------------------------------------------------------------------------------------------")
 
 #######################
 # Construct the model
@@ -294,7 +307,7 @@ if load_model_path or load_centers_path:
         os.makedirs(new_dir)
     local_save_directory = new_dir  # ✅ Set after creation
     factornet, centers = load_model(factornet, centers, load_model_path, load_centers_path)
-factornet = nn.DataParallel(factornet, device_ids=devices) # Wrap model in DataParallel, must be done after loading the model
+#factornet = nn.DataParallel(factornet, device_ids=devices) # Wrap model in DataParallel, must be done after loading the model
 #factornet = torch.compile(factornet, mode="max-autotune") # must be compiled after DataParallel
 
 #------------------------ Initialize the optimizer -------------------
@@ -313,18 +326,13 @@ scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau( #learning rate scheduler
 p_samples = toy_data.inf_train_gen(dataset,batch_size = train_samples_size)
 training_samples = torch.tensor(p_samples, dtype=torch.float32, device=device)
 
-subfolder = os.path.join(
-            local_save_directory,
-            f"sample_size{train_samples_size}",
-            f"test_size{test_samples_size}",
-            f"batch_size{batch_size}",
-            f"centers{train_kernel_size}",
-            f"lr{lr}"
-        )
+subfolder = create_save_dir(local_save_directory)
 os.makedirs(subfolder, exist_ok=True)
 #centers = centers.to('cpu')
 filename_final = os.path.join(subfolder, 'centers.pt')
 torch.save(centers, filename_final) #save the centers (we fix them in the beginning)
+filename_final = os.path.join(subfolder, 'centers.png')
+LearnCholesky.plot_and_save_centers(centers, filename_final)
 del p_samples
 
 ###########################
@@ -348,18 +356,23 @@ try:
             sys.exit(1)
         iter_end = time.time()
         iter_time = iter_end - iter_start
-        max_mem = torch.cuda.max_memory_allocated() / 2**30  # in GiB
-        print(f"Peak memory usage: {max_mem} GiB")
+        #max_mem = torch.cuda.max_memory_allocated() / 2**30  # in GiB
+        #print(f"Peak memory usage: {max_mem} GiB")
+        for device_id in [0, 1]:  # assuming 2 GPUs: cuda:0 and cuda:1
+            print(f"Memory summary for cuda:{device_id}")
+            print(torch.cuda.memory_summary(device=f'cuda:{device_id}', abbreviated=False))
         if step % 100 == 0:
             print(f"Step {step} started")
             print(f'Step: {step}, Loss value: {loss_value:.3e}')
             with open(os.path.join(subfolder, "loss_log.csv"), "a") as f:
                 f.write(f"{step},{loss_value}\n")
-        if step % 2000 == 0:
+        if step % 1000 == 0:
             loss_start = time.time()
             loss0 = evaluate_model(factornet, centers, test_samples_size)
             loss_end = time.time()
             loss_time = loss_end - loss_start
+            save_training_slice_cov(factornet, centers, step, subfolder)
+            save_training_slice_log(iter_time, loss_time, step, max_mem, loss0, local_save_directory)
             if not math.isnan(loss0) and not math.isinf(loss0):
                 # Get old LR before stepping scheduler
                 old_lrs = [group['lr'] for group in optimizer.param_groups]
@@ -375,20 +388,24 @@ try:
                         logging.info(f"LR changed for param group {i} from {old_lr:.2e} to {new_lr:.2e} at step {step}")
             else:
                 print("⚠️ Warning: Skipping LR scheduler step due to invalid val_loss:", loss0)
-            save_training_slice_cov(factornet, centers, step, lr, batch_size, local_save_directory)
-            save_training_slice_log(iter_time, loss_time, step, max_mem, loss0, local_save_directory)
             # Sample and save generated images at intermediate steps
             with torch.no_grad():
                 filename_step_sample = os.path.join(subfolder, f"step{step:05d}")
                 LearnCholesky.plot_images_with_model(factornet, centers, plot_number=10, save_path=filename_step_sample)
                 logging.info(f"Saved samples at step {step} to {filename_step_sample}")
+                generated = LearnCholesky.sample_from_model(factornet, training_samples, sample_number=10)
+                l2 = torch.mean((generated - training_samples[:10])**2).item()
+                print(f"[Step {step}] L2 to training data: {l2:.2f}")
         if step < epochs - 1:
             del samples
             gc.collect()
             torch.cuda.empty_cache()
+        
 except Exception as e:
     logging.error(f"Training interrupted with error: {e}")
     # Optionally re-raise if you want to stop after logging raise
+    for handler in logging.root.handlers:
+        handler.flush()
 finally:
     ###############################
     # Evaluate the final model
@@ -398,7 +415,7 @@ finally:
     torch.cuda.empty_cache()
 
     loss0 = evaluate_model(factornet, centers, test_samples_size)    
-    save_training_slice_cov(factornet, centers, step, lr, batch_size, local_save_directory)
+    save_training_slice_cov(factornet, centers, step, local_save_directory)
     formatted_loss = f'{loss0:.3e}'  # Format the average with up to 1e-3 precision
     logging.info(f'After train, Average total_loss: {formatted_loss}')
 
@@ -416,3 +433,5 @@ finally:
     # Cleanup local temp dir
     shutil.rmtree(local_save_directory)
     logging.info("Cleaned up local temp directory.")
+    sys.stdout.flush()
+    sys.stderr.flush()

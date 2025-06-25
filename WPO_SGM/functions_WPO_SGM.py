@@ -34,9 +34,16 @@ def vectors_to_precision(vectors,dim):
     L[:, indices[0], indices[1]] = vectors.squeeze(1)
     
     # Construct the precision matrices using Cholesky factorization
-    C = torch.matmul(L, L.transpose(1, 2)) + 0.1 * torch.eye(dim).to(vectors.device) # (add identity matrix to maintain positive definiteness)
+    C = torch.matmul(L, L.transpose(1, 2)) + 0.05 * torch.eye(dim).to(vectors.device) # (add identity matrix to maintain positive definiteness)
     
     return C
+
+def vectors_to_precision_chunked(vectors, dim, chunk_size=10):
+    results = []
+    for i in range(0, vectors.size(0), chunk_size):
+        chunk = vectors[i:i+chunk_size]
+        results.append(vectors_to_precision(chunk, dim))
+    return torch.cat(results, dim=0)
 
 import torch
 import torch.nn.functional as F
@@ -469,7 +476,7 @@ def score_implicit_matching(factornet, samples, centers):
     factor_eval = checkpoint(factornet, centers, use_reentrant=False)
     #factor_eval = factornet(centers)
     #precisions = vectors_to_precision(factor_eval, dim, chunk_size=2)
-    precisions = vectors_to_precision(factor_eval, dim)
+    precisions = vectors_to_precision_chunked(factor_eval, dim)
     #v_to_p_comp = torch.compile(vectors_to_precision_chunked)
     #precisions = v_to_p_comp(factor_eval, dim, chunk_size=2)
     #cond_numbers = LA.cond(precisions)  # condition number per matrix

@@ -13,8 +13,8 @@ WORKDIR /app
 # Set environment variables for non-interactive apt
 ENV DEBIAN_FRONTEND=noninteractive TZ=Etc/PDT
 # Set PyTorch CUDA memory allocation configuration
-ENV PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:32,expandable_segments:True
-
+#ENV PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:64,expandable_segments:True
+ENV PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
 
 # Install required system packages for torch.compile
 RUN apt-get update && \
@@ -35,4 +35,4 @@ RUN pip install --no-cache-dir -r requirements.txt && \
 # Optional: expose port if it's a web app
 # EXPOSE 8080
 
-ENTRYPOINT ["python", "train_wpo_sgm.py"]
+ENTRYPOINT ["python", "train_wpo_sgm_gcloud.py"]
