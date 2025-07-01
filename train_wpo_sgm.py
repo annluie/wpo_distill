@@ -19,6 +19,7 @@ import numpy as np
 import pandas as pd
 from pandas.plotting import scatter_matrix as pdsm
 import matplotlib.pyplot as plt
+import math
 
 # ------------------- PYTORCH -------------------
 import torch
@@ -33,8 +34,9 @@ import torch._dynamo
 torch._dynamo.config.suppress_errors = True
 # ------------------- PROJECT MODULES -------------------
 from WPO_SGM import toy_data
-#from WPO_SGM import functions_WPO_SGM as LearnCholesky
-from WPO_SGM import function_cpu as LearnCholesky
+from plots import *
+from WPO_SGM import functions_WPO_SGM as LearnCholesky
+#from WPO_SGM import function_cpu as LearnCholesky
 
 ###################
 # functions
@@ -52,8 +54,30 @@ def construct_factor_model(dim:int, depth:int, hidden_units:int):
     for _ in range(depth-1):
         chain.append(nn.Linear(int(hidden_units),int(hidden_units),bias = True))
         chain.append(nn.GELU())
-    chain.append(nn.Linear(int(hidden_units),int(dim*(dim+1)/2),bias = True)) 
-
+    
+    # Final layer - this is crucial for stability
+    final_layer = nn.Linear(hidden_units, int(dim*(dim+1)/2), bias=True)
+    
+    # Initialize final layer to produce identity-like matrices
+    with torch.no_grad():
+        final_layer.weight.data.fill_(0.0)
+        final_layer.bias.data.fill_(0.0)
+        
+        # # Set diagonal elements to small positive values
+        # tril_indices = torch.tril_indices(dim, dim)
+        # diag_mask = tril_indices[0] == tril_indices[1]
+        # final_layer.bias.data[diag_mask] = 0.1  # Small positive for diagonal
+        diagonal_indices = []
+        k = 0
+        for i in range(dim):
+            for j in range(i + 1):  # i >= j for lower triangle
+                if i == j:
+                    diagonal_indices.append(k)
+                k += 1
+        final_layer.bias.data[diagonal_indices] = 0.1
+    chain.append(final_layer)
+    
+    #chain.append(nn.Linear(int(hidden_units),int(dim*(dim+1)/2),bias = True)) 
     return nn.Sequential(*chain)
 
 def load_model(model, centers, load_model_path, load_centers_path):   
@@ -93,7 +117,8 @@ def load_model(model, centers, load_model_path, load_centers_path):
     
 #-----------------------  HELPER FUNCTIONS -------------------
 # Define a compiled function that takes factornet, samples, centers as inputs
-compiled_score = torch.compile(LearnCholesky.score_implicit_matching)
+#compiled_score = torch.compile(LearnCholesky.score_implicit_matching_optimized)
+#compiled_score = torch.compile(LearnCholesky.score_implicit_matching)
 
 def evaluate_model(factornet, kernel_centers, num_test_sample): 
     '''
@@ -106,7 +131,9 @@ def evaluate_model(factornet, kernel_centers, num_test_sample):
             p_samples = toy_data.inf_train_gen(dataset,batch_size = num_test_sample)
             testing_samples = torch.as_tensor(p_samples, dtype=torch.float32, device=device)
             #total_loss = compiled_score(factornet, testing_samples, kernel_centers)
-            total_loss = LearnCholesky.score_implicit_matching(factornet, testing_samples, kernel_centers)
+            #total_loss = LearnCholesky.score_implicit_matching(factornet, testing_samples, kernel_centers, stab)
+            total_loss = LearnCholesky.score_implicit_matching_stable(factornet, testing_samples, kernel_centers, stab)
+            #total_loss = LearnCholesky.score_implicit_matching_optimized(factornet, testing_samples, kernel_centers, stab)
             total_loss_sum += total_loss.item()
              # Free up memory
             del p_samples, testing_samples, total_loss
@@ -120,12 +147,15 @@ def opt_check(factornet, samples, centers, optimizer):
     Optimization function that computes the loss and performs backpropagation using mixed precision
     '''
     optimizer.zero_grad(set_to_none=True)
-    loss = LearnCholesky.score_implicit_matching(factornet, samples, centers)
+    #loss = LearnCholesky.score_implicit_matching(factornet, samples, centers, stab)
+    loss = LearnCholesky.score_implicit_matching_stable(factornet, samples, centers, stab)
+    #loss = LearnCholesky.score_implicit_matching_optimized(factornet, samples, centers, stab)
     #scaler.scale(loss).backward()
     #scaler.step(optimizer)
     #scaler.update()
+    torch.autograd.set_detect_anomaly(True)
     loss.backward()
-    torch.nn.utils.clip_grad_norm_(factornet.parameters(), max_norm=1.0) #gradient clipping
+    torch.nn.utils.clip_grad_norm_(factornet.parameters(), max_norm=100.0) #gradient clipping
     optimizer.step()
     return loss
 
@@ -141,7 +171,9 @@ def create_save_dir(save):
             f"test_size{test_samples_size}",
             f"batch_size{batch_size}",
             f"centers{train_kernel_size}",
-            f"lr{lr}_hu{hidden_units}"
+            f"lr{lr}_hu{hidden_units}_stab{stab}_stabveropt"
+            #f"lr{lr}_hu{hidden_units}_stab{stab}_stabver"
+            #f"lr{lr}_hu{hidden_units}_stab{stab}"
         )
         os.makedirs(subfolder, exist_ok=True)
     else:
@@ -150,7 +182,9 @@ def create_save_dir(save):
             f"test_size{test_samples_size}",
             f"batch_size{batch_size}",
             f"centers{train_kernel_size}",
-            f"lr{lr}_hu{hidden_units}"
+            f"lr{lr}_hu{hidden_units}_stab{stab}_stabveropt"
+            #f"lr{lr}_hu{hidden_units}_stab{stab}_stabver"
+            #f"lr{lr}_hu{hidden_units}_stab{stab}"
         )
         os.makedirs(subfolder, exist_ok=True)
     return subfolder
@@ -184,7 +218,7 @@ def save_training_slice_log(iter_time, loss_time, epoch, max_mem, loss_value, sa
         logging.info(
         f"Step {epoch:04d} | Iter Time: {iter_time:.4f}s | "
         f"Loss Time: {loss_time:.4f}s | Loss: {loss_value:.6f} | "
-        f"Max Mem: {max_mem:.2f} MB"
+        f"Max Mem: {max_mem:.2f} GB | "
         )   
 ###################
 # setup
@@ -202,6 +236,8 @@ else:
 
 # ------------------- SET PARAMETERS -------------------
 torch.set_float32_matmul_precision('high') # set precision for efficient matrix multiplication
+# Setup optimal device settings once at startup
+LearnCholesky.setup_optimal_device_settings()
 
 # setup argument parser
 parser = argparse.ArgumentParser()
@@ -217,6 +253,7 @@ parser.add_argument('--train_samples_size',type = int, default = 500)
 parser.add_argument('--test_samples_size',type = int, default = 5)
 parser.add_argument('--load_model_path', type = str, default = None)
 parser.add_argument('--load_centers_path', type = str, default = None)
+parser.add_argument('--stability', type=float, default = 0.01)
 args = parser.parse_args()
 
 # set parameters from args
@@ -232,12 +269,13 @@ depth = args.depth
 save_directory = args.save
 load_model_path = args.load_model_path
 load_centers_path = args.load_centers_path
+stab = args.stability
 
 #-------------------- Initialize Data -------------------
 # check the dataset
 if dataset not in ['swissroll', '8gaussians', 'pinwheel', 'circles', 'moons', '2spirals', 'checkerboard', 'rings','swissroll_6D_xy1', 'cifar10']:
     dataset = 'cifar10'
-means  = torch.tensor(toy_data.inf_train_gen(dataset, batch_size = train_kernel_size)).to(dtype = torch.float32)
+means  = toy_data.inf_train_gen(dataset, batch_size = train_kernel_size).clone().detach().to(dtype=torch.float32, device=device)
 data_dim = means.shape[1]
 del means
 torch.cuda.empty_cache()
@@ -265,11 +303,7 @@ logging.info(f"-----------------------------------------------------------------
 #######################
 #------------------------ Initialize the model -------------------
 factornet = construct_factor_model(data_dim, depth, hidden_units).to(device).to(dtype = torch.float32)
-centers = torch.tensor(
-    toy_data.inf_train_gen(dataset, batch_size=train_kernel_size),
-    dtype=torch.float32,
-    device=device
-)
+centers = toy_data.inf_train_gen(dataset, batch_size=train_kernel_size).clone().detach().to(dtype=torch.float32, device=device)
 #factornet = nn.DataParallel(factornet, device_ids=devices)
 # Load model and centers if specified
 if load_model_path or load_centers_path:
@@ -286,19 +320,21 @@ factornet = nn.DataParallel(factornet, device_ids=devices) # Wrap model in DataP
 #------------------------ Initialize the optimizer -------------------
 lr = args.lr
 optimizer = optim.Adam(factornet.parameters(), lr=args.lr)
-scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau( #learning rate scheduler
+#scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: min(1.0, step / 500))
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
     optimizer,
     mode='min',
     factor=0.5,
     patience=5,
-    threshold=1e-4,
+    threshold=10.0,           # only triggers if loss doesn't improve by at least 10
+    threshold_mode='abs',
     cooldown=2,
     min_lr=1e-7,
     verbose=True
 )
 
 p_samples = toy_data.inf_train_gen(dataset,batch_size = train_samples_size)
-training_samples = torch.tensor(p_samples, dtype=torch.float32, device=device)
+training_samples = p_samples.clone().detach().to(dtype=torch.float32, device=device)
 
 filename_final = os.path.join(save_directory, 'centers.pt')
 #generate centers as subset of training samples
@@ -330,7 +366,12 @@ for step in trange(epochs, desc="Training"):
     iter_end = time.time()
     iter_time = iter_end - iter_start
     max_mem = torch.cuda.max_memory_allocated() / 2**30  # in GiB
-    print(f"Peak memory usage: {max_mem} GiB")
+    #print(f"Peak memory usage: {max_mem} GiB")
+    '''
+    for device_id in [0, 1]:  # assuming 2 GPUs: cuda:0 and cuda:1
+        print(f"Memory summary for cuda:{device_id}")
+        print(torch.cuda.memory_summary(device=f'cuda:{device_id}', abbreviated=False))
+    '''
     if step % 100 == 0:
         print(f"Step {step} started")
         print(f'Step: {step}, Loss value: {loss_value:.3e}')
@@ -341,9 +382,10 @@ for step in trange(epochs, desc="Training"):
         loss0 = evaluate_model(factornet, centers, test_samples_size)
         loss_end = time.time()
         loss_time = loss_end - loss_start
-        save_training_slice_cov(factornet, centers, step, save_directory)
+        #save_training_slice_cov(factornet, centers, step, save_directory)
         save_training_slice_log(iter_time, loss_time, step, max_mem, loss0, save_directory)
-        if not torch.isnan(loss0) and not torch.isinf(loss0):
+        #if not torch.isnan(loss0) and not torch.isinf(loss0):
+        if not math.isnan(loss0) and not math.isinf(loss0):
                 # Get old LR before stepping scheduler
                 old_lrs = [group['lr'] for group in optimizer.param_groups]
                 scheduler.step(loss0)
@@ -365,6 +407,9 @@ for step in trange(epochs, desc="Training"):
             generated = LearnCholesky.sample_from_model(factornet, training_samples, sample_number=10)
             l2 = torch.mean((generated - training_samples[:10])**2).item()
             print(f"[Step {step}] L2 to training data: {l2:.2f}")
+            logging.info(f"L2 {l2:.2f} | ")
+    if step % 1000 == 0:
+        save_training_slice_cov(factornet, centers, step, save_directory)
     if step < epochs - 1:
         del samples
         gc.collect()
@@ -378,7 +423,7 @@ gc.collect()
 torch.cuda.empty_cache()
 
 loss0 = evaluate_model(factornet, centers, test_samples_size)    
-save_training_slice_cov(factornet, centers, step, lr, batch_size, save_directory)
+save_training_slice_cov(factornet, centers, step, save_directory)
 formatted_loss = f'{loss0:.3e}'  # Format the average with up to 1e-3 precision
 logging.info(f'After train, Average total_loss: {formatted_loss}')
 
