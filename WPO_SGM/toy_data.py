@@ -136,7 +136,7 @@ def inf_train_gen(data, rng=None, batch_size=200):
             transforms.ToTensor(),
             transforms.Normalize((0.5,), (0.5,)) # Normalize from [0,1] to [-1,1]
         ])  
-        '''
+        
         #normalize to have mean 0 and std 1 for each channel
         transform = transforms.Compose([
             transforms.ToTensor(),
@@ -149,8 +149,25 @@ def inf_train_gen(data, rng=None, batch_size=200):
         # flatten images to [batch_size, 3072] for score model input (vs [batch_size, 3, 32, 32])
         for images, _ in train_loader:
             flat_images = images.view(images.size(0), -1)  # shape: [64, 3072]
-            print(flat_images.min(), flat_images.max())    # should be around -1 to 1
+            #print(flat_images.min(), flat_images.max())    # should be around -1 to 1
             break
+        return flat_images
+        '''
+        if 'train_loader' not in locals():
+            # Normalize to mean=0, std=1 for each channel
+            transform = transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
+            ])
+            b = batch_size
+            train_dataset = datasets.CIFAR10(root='./data', train=True, download=True, transform=transform)
+            train_loader = DataLoader(train_dataset, batch_size=b, shuffle=True, num_workers=4)
+
+        # Flatten one batch of images to [batch_size, 3072] for model input
+        for images, _ in train_loader:
+            flat_images = images.view(images.size(0), -1)
+            break
+
         return flat_images
     else:
         return inf_train_gen("8gaussians", rng, batch_size)
