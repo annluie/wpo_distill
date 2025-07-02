@@ -7,7 +7,7 @@ from torch.distributions.multivariate_normal import MultivariateNormal
 import lib.toy_data as toy_data
 import numpy as np
 import argparse
-
+import gc
 
 ## vector to precision matrix function
 def vectors_to_precision(vectors,dim):
@@ -52,7 +52,7 @@ def mog_density(x, means, precisions):
     
     # Use logsumexp to calculate the log of the mixture density
     log_densities = torch.logsumexp(log_component_probs, dim=1)  # Shape: (batch_size,)
-    
+    torch.cuda.empty_cache()
     return log_densities.exp()
 
 
@@ -93,36 +93,93 @@ def gradient_mog_density(x, means, precisions):
 
     # Multiply by prob and sum over components to get the gradient
     gradient = (-log_prob.exp() * x_mean_cov).sum(dim=1)  # Shape: (batch_size, 2)
-    
+    torch.cuda.empty_cache()
+    del x_mean_cov
     return gradient / num_components
 
 # Compute grad log pi
 def grad_log_mog_density(x, means, precisions):
+    #cpu_device = torch.device("cpu") # move to cpu to save memory
     x = x.unsqueeze(1)  # Shape: (batch_size, 1, 2)
     dim = x.size(-1)
     batch_size, num_components = x.size(0), means.size(0)
+    
+    gc.collect()
+    torch.cuda.empty_cache()
+    
+    #x_cpu = x.to(cpu_device).unsqueeze(1)
+    #means_cpu = means.to(cpu_device)
+    #precisions_cpu = precisions.to(cpu_device)
+    #dim = x_cpu.size(-1)
+    #batch_size, num_components = x_cpu.size(0), means_cpu.size(0)
 
     # Create a batch of Multivariate Normal distributions for each component
-    mvns = MultivariateNormal(loc=means, precision_matrix=precisions)
+    #mvns = MultivariateNormal(loc=means, precision_matrix=precisions)
+    mvns_list = safe_multivariate_normal(means,precisions)
 
     # Calculate the log probabilities for each component
-    log_probs = mvns.log_prob(x)  # Shape: (batch_size, num_components)
+    #log_probs = mvns.log_prob(x)  # Shape: (batch_size, num_components)
+    #log_probs = torch.stack([mvn.log_prob(x) for mvn in mvns_list], dim = 1)
+    #log_probs = torch.stack([mvn.log_prob(x.cpu()) for mvn in mvns_list], dim=1)
+    
+    log_probs_list =[]
+    for i in range(0, len(mvns_list), 2):
+        batch_mvns = mvns_list[i:i+2]
+        log_probs_batch = [mvn.log_prob(x.cpu()).squeeze(-1) for mvn in batch_mvns]
+        log_probs_list.extend(log_probs_batch)
+    for idx, lp in enumerate(log_probs_batch):
+        print(f"log_prob_batch[{idx}] shape: {lp.shape}")
+    log_probs = torch.stack(log_probs_list, dim=1)
+    print(f"log_probs shape after stack: {log_probs.shape}")
+    log_probs = log_probs.to(x.device)
+    #log_probs = safe_log_probs(x, means, precisions, 1)
 
     # Use torch.logsumexp to compute the log of the sum of exponentiated log probabilities
     log_sum_exp = torch.logsumexp(log_probs, dim=1, keepdim=True)  # Shape: (batch_size, 1)
-
+    print("log_sum_exp size:", log_sum_exp.shape)
     # Calculate the softmax probabilities along the components dimension
     softmax_probs = torch.softmax(log_probs, dim=1)  # Shape: (batch_size, num_components)
+    print("softmax_probs size:", softmax_probs.shape)
     x_mean = x - means  # Shape: (batch_size, num_components, 2)
     x_mean_reshaped = x_mean.view(batch_size, num_components, dim, 1)
     precision_matrix = precisions.unsqueeze(0)  # Shape: (1, num_components, 2, 2)
     precision_matrix = precision_matrix.expand(x.shape[0], -1, -1, -1)  # Shape: (batch_size, num_components, 2, 2)
-
-    x_mean_cov = torch.matmul(precision_matrix, x_mean_reshaped).squeeze(dim = -1)
+    
+    """
+    x_mean_cpu = x_cpu - means_cpu  # Shape: (batch_size, num_components, 2)
+    x_mean_reshaped_cpu = x_mean_cpu.view(batch_size, num_components, dim, 1)
+    precision_matrix_cpu = precisions_cpu.unsqueeze(0)  # Shape: (1, num_components, 2, 2)
+    precision_matrix_cpu = precision_matrix_cpu.expand(x_cpu.shape[0], -1, -1, -1)  # Shape: (batch_size, num_components, 2, 2)
+    """
+    gc.collect() 
+    torch.cuda.empty_cache()
+    print(f"GPU memory used: {torch.cuda.memory_allocated() / 1e6:.2f} MB")
+    #device = torch.device('cuda')
+    results = []
+    print(torch.cuda.memory_summary())
+    for i in range(0, precision_matrix.size(0), 1):
+        batch_prec = precision_matrix[i:i+1]
+        batch_x = x_mean_reshaped[i:i+1]
+        print(f"Batch precision matrix shape: {batch_prec.shape}")
+        print(f"Batch x_mean shape: {batch_x.shape}")
+        result = torch.matmul(batch_prec, batch_x).squeeze(-1)
+        results.append(result)
+        torch.cuda.empty_cache()
+        print(f"Processing batch {i}-{i+1}")
+        print(f"GPU memory used: {torch.cuda.memory_allocated() / 1e6:.2f} MB")
+    x_mean_cov = torch.cat(results, dim=0).to(x.device)
+    print("softmax_probs shape:", softmax_probs.shape)        # Should be [batch_size, K]
+    print("x_mean_cov shape:", x_mean_cov.shape)
+    print(f"x_mean_cov req grad:{x_mean_cov.requires_grad}")
+    print(f"softmax_probs req grad:{softmax_probs.requires_grad}")
+    #x_mean_cov_cpu = torch.matmul(precision_matrix, x_mean_reshaped).squeeze(dim = -1)
+    #x_mean_cov_cpu = torch.matmul(precision_matrix_cpu, x_mean_reshaped_cpu).squeeze(dim = -1)
+    #x_mean_cov = x_mean_cov_cpu.to(x.device)
     # Calculate the gradient of log density with respect to x
 
     gradient = -torch.sum(softmax_probs.unsqueeze(-1) * x_mean_cov, dim=1)
-    
+    #gradient = -torch.sum(softmax_probs.unsqueeze(-1) * x_mean_cov_cpu, dim=1)
+    print(f"GPU memory used: {torch.cuda.memory_allocated() / 1e6:.2f} MB")
     return gradient
 
 
@@ -148,11 +205,12 @@ def laplacian_mog_density(x, means, precisions):
     precision_matrix = precisions.unsqueeze(0)  # Shape: (1, num_components, 2, 2)
     precision_matrix = precision_matrix.expand(x.shape[0], -1, -1, -1)  # Shape: (batch_size, num_components, 2, 2)
 
-    mvn = MultivariateNormal(means, precision_matrix=precision_matrix)
-    
-    log_prob = mvn.log_prob(x) # Shape: (batch_size, num_components)
-    
+    #mvn = MultivariateNormal(means, precision_matrix=precision_matrix)
+    #log_prob = mvn.log_prob(x) # Shape: (batch_size, num_components)
+    log_prob =  safe_log_probs(x, means, precisions, batch_size=2)
+
     prob = log_prob.exp() # Shape: (batch_size, num_components)
+    torch.cuda.empty_cache()
 
     # Calculate the gradient components using matrix multiplication
     x_mean_cov = torch.matmul(precision_matrix, x_mean_reshaped).squeeze(-1)
@@ -169,13 +227,15 @@ def laplacian_mog_density(x, means, precisions):
 
 def laplacian_mog_density_div_density(x, means, precisions):
     x = x.unsqueeze(1)  # Shape: (batch_size, 1, 2)
+    print("x shape:", x.shape)
     batch_size, num_components = x.size(0), means.size(0)
 
     # Create a batch of Multivariate Normal distributions for each component
-    mvns = MultivariateNormal(loc=means, precision_matrix=precisions)
+    #mvns = MultivariateNormal(loc=means, precision_matrix=precisions)
 
     # Calculate the log probabilities for each component
-    log_probs = mvns.log_prob(x)  # Shape: (batch_size, num_components)
+    #log_probs = mvns.log_prob(x)  # Shape: (batch_size, num_components)
+    log_probs =safe_log_probs(x,means,precisions, 1)
 
     # Use torch.logsumexp to compute the log of the sum of exponentiated log probabilities
     log_sum_exp = torch.logsumexp(log_probs, dim=1, keepdim=True)  # Shape: (batch_size, 1)
@@ -186,7 +246,7 @@ def laplacian_mog_density_div_density(x, means, precisions):
     x_mean = x - means  # Shape: (batch_size, num_components, 2)
 
     # Calculate the covariance matrix term
-    cov_term = torch.matmul(precisions, x_mean.unsqueeze(-1)).squeeze(-1)  # Shape: (batch_size, num_components, 2)
+    cov_term = safe_laplacian_cov_term(x,means,precisions,batch_size=4)  # Shape: (batch_size, num_components, 2)
 
     # Calculate the squared linear term
     squared_linear = torch.sum(cov_term * cov_term, dim=-1)  # Shape: (batch_size, num_components)
@@ -207,6 +267,88 @@ def laplacian_mog_density_div_density(x, means, precisions):
     return laplacian_over_density
 
 
+def safe_log_probs(x, means, precisions, mbatch_size=16):
+    """
+    Compute log_probs of x under a mixture of Gaussians with given means and precisions,
+    without causing CUDA OOM errors.
+    """
+    results = []
+    num_components = means.size(0)
+
+    for i in range(0, num_components, mbatch_size):
+        end = min(i + mbatch_size, num_components)
+
+        mean_batch = means[i:end]                # Shape: (batch, D)
+        precision_batch = precisions[i:end]      # Shape: (batch, D, D)
+
+        mvn = MultivariateNormal(loc=mean_batch, precision_matrix=precision_batch)
+        # x: (N, 1, D), mvn: (batch, D) → broadcasting: (N, batch)
+        # We reshape x to match the batch broadcasting
+        log_prob = mvn.log_prob(x.squeeze(1))    # Result: (N,)
+        results.append(log_prob)
+        
+        del mean_batch, precision_batch
+        torch.cuda.empty_cache()
+
+    return torch.stack(results, dim=1)  # Final shape: (N, num_components)
+
+def safe_multivariate_normal(means, precisions, batch_size=128):
+    """
+    Returns a list of MultivariateNormal objects, created in batches.
+    Inputs:
+        means      : (M, D)
+        precisions : (M, D, D)
+    Returns:
+        mvns_list : List of M MultivariateNormal objects
+    """
+    mvns_list = []
+    M = means.shape[0]
+    for i in range(0, M, batch_size):
+        end = min(i + batch_size, M)
+        means_batch = means[i:end]
+        precisions_batch = precisions[i:end]
+
+        # Create list of individual MVNs
+        for mean, prec in zip(means_batch, precisions_batch):
+            mvn = MultivariateNormal(loc=mean.cpu(), precision_matrix=prec.cpu())
+            mvns_list.append(mvn)
+
+        torch.cuda.empty_cache()  # Optional but helps reduce memory spikes    
+    return mvns_list
+
+
+def safe_laplacian_cov_term(x, means, precisions, batch_size=128):
+    """
+    Computes cov_term = precision @ (x - mean).T in chunks.
+    Returns: Tensor of shape (N, M, D)
+    """
+    x=x.squeeze() # Remove extra singleton dims, e.g., from (N,1,D) → (N,D)
+    N, D = x.shape
+    M = means.shape[0]
+    results = []
+
+    for i in range(0, M, batch_size):
+        end = min(i + batch_size, M)
+        means_chunk = means[i:end]             # (B, D)
+        precisions_chunk = precisions[i:end]   # (B, D, D)
+
+        # Broadcast (N, B, D): (N, 1, D) - (1, B, D)
+        x_mean = x.unsqueeze(1) - means_chunk.unsqueeze(0)
+
+        # (N, B, D) → (N, B, D, 1)
+        x_mean = x_mean.unsqueeze(-1)
+
+        # (B, D, D) → (1, B, D, D)
+        precisions_exp = precisions_chunk.unsqueeze(0)
+
+        # Matrix multiply: (N, B, D, D) x (N, B, D, 1)
+        cov_term_chunk = torch.matmul(precisions_exp, x_mean).squeeze(-1)  # (N, B, D)
+
+        results.append(cov_term_chunk)
+        torch.cuda.empty_cache()
+
+    return torch.cat(results, dim=1)  # Final shape: (N, M, D)
+
 
 #----------------------------------------------#
 def score_implicit_matching(factornet,samples,centers):
@@ -215,8 +357,9 @@ def score_implicit_matching(factornet,samples,centers):
     # create precision matrix from the cholesky factor
     dim = centers.shape[-1]
     precisions = vectors_to_precision(factor_eval,dim)
-  
+     
     laplacian_over_density = laplacian_mog_density_div_density(samples,centers,precisions)
+    torch.cuda.empty_cache()
     gradient_eval_log = grad_log_mog_density(samples,centers,precisions)
     # square gradient
     gradient_eval_log_squared = torch.sum(gradient_eval_log * gradient_eval_log, dim=1)
