@@ -1,0 +1,18 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+*.dll
+*.exe
+*.log
+*.tar
+*.zip
+.venv/
+checkpoints/
+data/
+cifar10_experiments/
+
+# Ignore Git files
+.git
+.gitignore
