@@ -521,9 +521,6 @@ for step in trange(epochs, desc="Training"):
             print("⚠️ Warning: Skipping LR scheduler step due to invalid val_loss:", loss0)
         # Sample and save generated images at intermediate steps
         with torch.no_grad():
-            filename_step_sample = os.path.join(save_directory, f"step{step:05d}")
-            LearnCholesky.plot_images_with_model(factornet, centers, plot_number=10, eps=stab, save_path=filename_step_sample)
-            logging.info(f"Saved samples at step {step} to {filename_step_sample}")
             generated = LearnCholesky.sample_from_model(factornet, training_samples, sample_number=10, eps=stab)
             l2 = torch.mean((generated - training_samples[:10])**2).item()
             print(f"[Step {step}] L2 to training data: {l2:.2f}")
