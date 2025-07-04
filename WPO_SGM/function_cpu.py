@@ -3,6 +3,7 @@ import os
 import torch
 import torch.optim as optim
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.distributions.multivariate_normal import MultivariateNormal
 import lib.toy_data as toy_data
 import numpy as np
@@ -35,8 +36,14 @@ def vectors_to_precision(vectors,dim):
     C = torch.matmul(L, L.transpose(1, 2)) + 0.05 * torch.eye(dim).to(vectors.device) # (add identity matrix to maintain positive definiteness)
     
     return C
-import torch
-import torch.nn.functional as F
+
+def vectors_to_precision_chunked(vectors, dim, chunk_size=10):
+    batch_size = vectors.size(0)
+    output = torch.empty(batch_size, dim, dim, dtype=vectors.dtype, device=vectors.device)
+    for i in range(0, batch_size, chunk_size):
+        chunk = vectors[i:i+chunk_size]
+        output[i:i+chunk_size] = vectors_to_precision(chunk, dim)
+    return output
 
 def vectors_to_precision_stab(vectors, dim, eps=1e-4, scale_offdiag=0.1):
     batch_size = vectors.shape[0]
@@ -56,6 +63,7 @@ def vectors_to_precision_stab(vectors, dim, eps=1e-4, scale_offdiag=0.1):
 
     C = L @ L.transpose(-1, -2)
     return C
+
 #----------------------------------------------#
 #### Mixture of Gaussians functions ####
 #----------------------------------------------#
@@ -264,6 +272,73 @@ def laplacian_mog_density_div_density_chunked(x, means, precisions, chunk_size=1
         gc.collect()
         torch.cuda.empty_cache()
     return torch.cat(results, dim=0)
+def laplacian_mog_density_div_density_chunked_components(x, means, precisions, chunk_size=32):
+    batch_size, dim = x.shape
+    num_components = means.shape[0]
+
+    # Accumulate partial results
+    all_log_probs = []
+    all_squared_linear = []
+    all_trace_precision = []
+
+    # Compute chunked contributions
+    for start in range(0, num_components, chunk_size):
+        end = min(start + chunk_size, num_components)
+
+        means_chunk = means[start:end]  # (chunk_size, dim)
+        precisions_chunk = precisions[start:end]  # (chunk_size, dim, dim)
+
+        x_expanded = x.unsqueeze(1)  # (B, 1, D)
+        x_mean = x_expanded - means_chunk  # (B, chunk_size, D)
+
+        # Compute log probs using Mahalanobis term: -0.5 * x^T P x + const
+        cov_term = torch.einsum("kij,bkj->bki", precisions_chunk, x_mean)  # (B, chunk_size, D)
+        squared_linear = torch.sum(cov_term * cov_term, dim=-1)  # (B, chunk_size)
+
+        # log det precision = -log det cov = + log det precision
+        log_det = torch.logdet(precisions_chunk)  # (chunk_size,)
+        log_det = log_det.unsqueeze(0).expand(batch_size, -1)  # (B, chunk_size)
+
+        log_probs_chunk = 0.5 * log_det - 0.5 * squared_linear - 0.5 * dim * torch.log(torch.tensor(2 * torch.pi, device=x.device, dtype=x.dtype))
+
+        # trace of precision
+        trace_chunk = torch.diagonal(precisions_chunk, dim1=-2, dim2=-1).sum(dim=-1)  # (chunk_size,)
+        trace_chunk = trace_chunk.unsqueeze(0).expand(batch_size, -1)  # (B, chunk_size)
+
+        all_log_probs.append(log_probs_chunk)
+        all_squared_linear.append(squared_linear)
+        all_trace_precision.append(trace_chunk)
+
+        # Optional memory cleanup
+        del x_mean, cov_term, squared_linear, trace_chunk, log_probs_chunk
+        torch.cuda.empty_cache()
+
+    # Concatenate across component dimension
+    log_probs = torch.cat(all_log_probs, dim=1)  # (B, K)
+    squared_linear = torch.cat(all_squared_linear, dim=1)  # (B, K)
+    trace_precision = torch.cat(all_trace_precision, dim=1)  # (B, K)
+
+    # Compute softmax over full set of components
+    softmax_probs = torch.softmax(log_probs, dim=1)  # (B, K)
+
+    laplacian_component = softmax_probs * (squared_linear - trace_precision)  # (B, K)
+    laplacian_over_density = laplacian_component.sum(dim=1)  # (B,)
+
+    return laplacian_over_density
+def laplacian_mog_density_div_density_double_chunked(x, means, precisions, 
+                                                    batch_chunk_size=16, 
+                                                    component_chunk_size=32):
+    results = []
+    for start in range(0, x.size(0), batch_chunk_size):
+        end = min(start + batch_chunk_size, x.size(0))
+        x_chunk = x[start:end]
+        # Call component-wise chunked function for each batch chunk
+        result_chunk = laplacian_mog_density_div_density_chunked_components(
+            x_chunk, means, precisions, chunk_size=component_chunk_size)
+        results.append(result_chunk.detach() if not result_chunk.requires_grad else result_chunk)
+        del result_chunk, x_chunk
+        torch.cuda.empty_cache()
+    return torch.cat(results, dim=0)
 
 def grad_log_mog_density_chunked(x, means, precisions, chunk_size=2):
     outputs = []
@@ -283,12 +358,17 @@ def score_implicit_matching(factornet,samples,centers):
     #centers = centers.detach()
     centers.requires_grad_(True)
     dim = centers.shape[-1]
-    #factor_eval = checkpoint(factornet,centers, use_reentrant=False)
+    #factor_eval = checkpoint(factornet, centers, use_reentrant=False)
     factor_eval = factornet(centers)
-    precisions = vectors_to_precision(factor_eval,dim)
-    eigs = torch.linalg.eigvalsh(precisions)
-    min_eig = eigs.min(dim=1).values
-    print("Min eigenvalue per batch:", min_eig)
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    precisions = vectors_to_precision_chunked(factor_eval, dim)
+    for i in range(torch.cuda.device_count()):
+        print(f"[chunked] GPU {i}: {torch.cuda.max_memory_allocated(i) / 1e9:.2f} GB")
+    #precisions = vectors_to_precision_chunked(factor_eval, dim)
+    #eigs = torch.linalg.eigvalsh(precisions)
+    #min_eig = eigs.min(dim=1).values
+    #print("Min eigenvalue per batch:", min_eig)
     del factor_eval
     torch.cuda.empty_cache()
     #with autocast("cuda"):
@@ -297,7 +377,11 @@ def score_implicit_matching(factornet,samples,centers):
     #print(f"samples requires grad: {samples.requires_grad}")
     #print(f"centers requires grad: {centers.requires_grad}")
     #laplacian_over_density = laplacian_mog_density_div_density(samples,centers,precisions)
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
     laplacian_over_density = laplacian_mog_density_div_density_chunked(samples,centers,precisions)
+    for i in range(torch.cuda.device_count()):
+        print(f"[not double-chunked] GPU {i}: {torch.cuda.max_memory_allocated(i) / 1e9:.2f} GB")
     gradient_eval_log = grad_log_mog_density_chunked(samples,centers,precisions)
     del precisions
     gradient_eval_log_squared = (gradient_eval_log ** 2).sum(dim=1)
