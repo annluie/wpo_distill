@@ -4,25 +4,19 @@
 import matplotlib.pyplot as plt
 import os
 import torch
-import torch.optim as optim
-import torch.nn as nn
 from torch.distributions.multivariate_normal import MultivariateNormal
-import lib.toy_data as toy_data
 import numpy as np
-import argparse
-from memory_profiler import profile
-from torch.amp import autocast
-from torch.utils.checkpoint import checkpoint
 import torch.nn.functional as F
-import torch.linalg as LA
 import torchvision.utils as vutils
-import time
-from functions_WPO_SGM import vectors_to_precision
-
-def sample_from_model(factornet, means, sample_number):
+from WPO_SGM.functions_WPO_SGM_stable import vectors_to_precision_stable
+from WPO_SGM.functions_WPO_SGM import vectors_to_precision
+def sample_from_model(factornet, means, sample_number, eps, use_stable=False):
     num_components, dim = means.shape
-    comp_num = torch.randint(0, num_components, (sample_number,), device=means.device)
-    samples = torch.empty(sample_number, dim, device=means.device)
+    device = means.device
+    dtype = means.dtype
+
+    comp_num = torch.randint(0, num_components, (sample_number,), device=device)
+    samples = torch.empty(sample_number, dim, device=device, dtype=dtype)
 
     unique_indices = comp_num.unique()
 
@@ -31,24 +25,66 @@ def sample_from_model(factornet, means, sample_number):
         n_i = idx.shape[0]
         centers_i = means[i].unsqueeze(0).expand(n_i, -1)  # [n_i, dim]
 
-        # Get model output vectors (flattened Cholesky)
         vectors = factornet(centers_i)  # [n_i, d*(d+1)//2]
 
-        # Use your existing function to get precision matrix with stabilization
-        precision = vectors_to_precision(vectors, dim)  # [n_i, dim, dim]
+        # Choose precision method
+        try:
+            if use_stable:
+                precision = vectors_to_precision_stable(vectors, dim, eps)
+            else:
+                precision = vectors_to_precision(vectors, dim, 0.001)
 
-        # Create multivariate normal with precision matrix
+            # Check positive definiteness
+            torch.linalg.cholesky(precision)
+        except RuntimeError:
+            print("⚠️ Precision matrix not PD, using fallback identity.")
+            precision = torch.eye(dim, device=device, dtype=dtype).unsqueeze(0).repeat(n_i, 1, 1)
+
         mvn = MultivariateNormal(loc=centers_i, precision_matrix=precision)
-
-        # Sample from this distribution
         samples_i = mvn.rsample()  # [n_i, dim]
-
         samples[idx] = samples_i
 
     return samples
 
+def plot_images_with_model(factornet, means, plot_number=10, eps=1e-4, save_path=None):
+    dim = means.shape[-1]
 
-def plot_images(means, precisions, epoch = 0, plot_number = 10, save_path=None):
+    # Get two sets of samples: standard and stable
+    samples1 = sample_from_model(factornet, means, plot_number, eps, use_stable=False)
+    samples2 = sample_from_model(factornet, means, plot_number, eps, use_stable=True)
+
+    # Denormalize using CIFAR-10 statistics
+    def format_samples(samples):
+        samples = samples.view(-1, 3, 32, 32)
+        samples = denormalize_cifar10(samples)
+        samples = torch.clamp(samples, 0, 1)
+        return samples
+
+    samples1 = format_samples(samples1)
+    samples2 = format_samples(samples2)
+
+    # Plot 2 rows: first row = standard, second row = stable
+    fig, axs = plt.subplots(2, plot_number, figsize=(plot_number * 1.5, 4))
+    for row, samples in enumerate([samples1, samples2]):
+        for i in range(plot_number):
+            img = samples[i].permute(1, 2, 0).cpu().numpy()
+            axs[row, i].imshow(img)
+
+            # Label the first image of each row
+            if i == 0:
+                axs[row, i].set_ylabel("Standard" if row == 0 else "Stable", fontsize=12)
+            else:
+                axs[row, i].set_yticks([])
+
+            axs[row, i].set_xticks([])
+            axs[row, i].tick_params(left=False, bottom=False)
+
+    if save_path is not None:
+        plt.savefig(save_path + '_sampled_images.png', bbox_inches='tight')
+    plt.close(fig)
+    return None
+
+def plot_images(means, precisions, plot_number = 10,  epoch = 0, save_path=None):
     # plots plot_number samples from the trained model for image data
     num_components = means.shape[0]
     # sample from the multivariate normal distribution
@@ -76,29 +112,6 @@ def plot_images(means, precisions, epoch = 0, plot_number = 10, save_path=None):
 
     return None
 
-def plot_images_with_model(factornet, means, plot_number = 10, save_path=None):
-    # plots plot_number samples from the trained model for image data
-    num_components = means.shape[0]
-    dim = means.shape[-1]
-    # sample from the multivariate normal distribution
-    comp_num = torch.randint(0, num_components, (1,plot_number)) #shape: [1, plot_number]
-    comp_num = comp_num.squeeze(0)  # shape: [plot_number]
-    samples = torch.empty(plot_number, dim, device=means.device)  # shape: [plot_number, d]
-    samples = sample_from_model(factornet, means, plot_number)
-    # transform images back to original data 
-    samples = samples.view(-1, 3, 32, 32)
-    samples = samples * 0.5 + 0.5
-    samples = torch.clamp(samples, 0, 1)  # clip to [0, 1] to avoid warnings
-    fig, axs = plt.subplots(1, plot_number, figsize=(15, 2))
-    for i in range(plot_number):
-        img = samples[i].permute(1, 2, 0).cpu().numpy()  # change from [C, H, W] to [H, W, C]
-        axs[i].imshow(img)
-        axs[i].axis('off')
-    if save_path is not None:
-        save_path = save_path + '_sampled_images.png'
-        plt.savefig(save_path)
-    plt.close(fig)
-    return None
 def denormalize_cifar10(tensor):
     """
     Denormalizes a batch of CIFAR-10 images from standardized (mean=0, std=1)
@@ -114,23 +127,30 @@ def denormalize_cifar10(tensor):
     std = torch.tensor([0.2023, 0.1994, 0.2010], device=tensor.device).view(1, 3, 1, 1)
     return tensor * std + mean
 
-import torchvision.utils as vutils
+def plot_and_save_centers(centers, save_path, nrow=10, upscale_factor=8):
+    centers = centers.view(-1, 3, 32, 32)  # CIFAR-10 shape
+    centers = denormalize_cifar10(centers).clamp(0, 1)
 
-def plot_and_save_centers(centers, save_path, nrow=10):
-    centers = centers.view(-1, 3, 32, 32)  # reshape
-    centers = denormalize_cifar10(centers).clamp(0, 1)  # denormalize and clip to [0, 1]
+    # Create grid image
+    grid = vutils.make_grid(centers, nrow=nrow, padding=6)
 
-    grid = vutils.make_grid(centers, nrow=nrow, padding=2)
+    # Upscale the grid using bilinear interpolation
+    grid = grid.unsqueeze(0)  # add batch dim for interpolation
+    height, width = grid.shape[2], grid.shape[3]
+    new_height = height * upscale_factor
+    new_width = width * upscale_factor
+    grid_upscaled = F.interpolate(grid, size=(new_height, new_width), mode='bilinear', align_corners=False).squeeze(0)
+
+    # Save upscaled image
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    vutils.save_image(grid, save_path)
-    print(f"Saved centers to {save_path}")
+    vutils.save_image(grid_upscaled, save_path)
+    print(f"Saved upscaled centers to {save_path}")
 
-    # Optional preview
-    plt.figure(figsize=(nrow, nrow))
+    # Show in matplotlib
+    plt.figure(figsize=(new_width / 100, new_height / 100), dpi=100)
     plt.axis("off")
-    plt.imshow(grid.permute(1, 2, 0).cpu().numpy())
+    plt.imshow(grid_upscaled.permute(1, 2, 0).cpu().numpy())
     plt.show()
-
 
 
 #---------OLD FUNCTIONS ----------------------------------

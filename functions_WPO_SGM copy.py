@@ -5,9 +5,9 @@ import torch.optim as optim
 import torch.nn as nn
 from torch.distributions.multivariate_normal import MultivariateNormal
 import numpy as np
+import argparse
 from memory_profiler import profile
-#from torch.amp.autocast_mode import autocast
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast
 from torch.utils.checkpoint import checkpoint
 import torch.nn.functional as F
 import torch.linalg as LA
@@ -525,7 +525,7 @@ def grad_and_laplacian_mog_density(x, means, precisions):
     logdet = logdet.unsqueeze(0).expand(x.shape[0], -1)  # (B, K)
 
     # Compute log probabilities once
-    log_probs = 0.5 * logdet - 0.5 * squared_linear - 0.5 * dim * torch.log(
+    log_probs = 0.5 * log_det - 0.5 * squared_linear - 0.5 * dim * torch.log(
         torch.tensor(2 * torch.pi, device=x.device, dtype=x.dtype))
     
     # Compute softmax probabilities once
@@ -542,7 +542,7 @@ def grad_and_laplacian_mog_density(x, means, precisions):
     laplacian_over_density = torch.sum(laplacian_component, dim=1)  # (B,)
     
     # Clean up
-    del x_mean, x_mean_cov, squared_linear, logdet, log_probs, softmax_probs
+    del x_mean, x_mean_cov, squared_linear, log_det, log_probs, softmax_probs
     torch.cuda.empty_cache()
     
     return gradient, laplacian_over_density
@@ -795,7 +795,8 @@ def vectors_to_precision_stable(vectors, dim, base_epsilon=1e-4, max_cond=1e12):
 
     return precision
 
-def vectors_to_precision_chunked_stable(vectors, dim, base_epsilon=1e-4, chunk_size=50):
+
+def vectors_to_precision_chunked_stable(vectors, dim, base_epsilon=1e-4, chunk_size=10):
     """
     Chunked version of stable precision matrix computation
     """
@@ -908,7 +909,7 @@ def grad_and_laplacian_mog_density_chunked_stable(x, means, precisions,
     return torch.cat(gradients, dim=0), torch.cat(laplacians, dim=0)
 
 def grad_and_laplacian_mog_density_component_chunked_stable(x, means, precisions, 
-                                                           chunk_size=256, temperature=1.0):
+                                                           chunk_size=64, temperature=1.0):
     """
     Component-wise chunked stable computation
     """
@@ -995,7 +996,7 @@ def numerical_health_check(tensor, name="tensor"):
     if torch.any(torch.isinf(tensor)):
         print(f"Warning: Inf detected in {name}")
         return False
-    if torch.any(torch.abs(tensor) > 1e12):
+    if torch.any(torch.abs(tensor) > 1e10):
         print(f"Warning: Very large values detected in {name} (max: {torch.max(torch.abs(tensor))})")
         return False
     return True
@@ -1010,9 +1011,7 @@ def score_implicit_matching_stable(factornet, samples, centers, base_epsilon=1e-
     torch.cuda.reset_peak_memory_stats()
     dim = centers.shape[-1]
     
-    # FIX: Since centers are fixed, don't make them require gradients
-    #centers = centers.clone().detach().requires_grad_(True)  # use this only for checkpoint
-    centers = centers.clone()  # Just clone for safety, no grad required
+    centers = centers.clone().detach().requires_grad_(True)
 
     for attempt in range(max_attempts):
         try:
@@ -1028,7 +1027,6 @@ def score_implicit_matching_stable(factornet, samples, centers, base_epsilon=1e-
                 factor_eval = factornet(centers)
             factor_eval = factor_eval.float()  # <-- cast back to float32 here
             '''
-            #factor_eval = checkpoint(factornet, centers, use_reentrant=False)
             factor_eval = factornet(centers)
             #print(f"✅ Factornet forward time: {time.time() - t1:.4f} sec")
 
@@ -1040,7 +1038,7 @@ def score_implicit_matching_stable(factornet, samples, centers, base_epsilon=1e-
             # === PRECISION CONSTRUCTION ===
             t2 = time.time()
             #precisions = vectors_to_precision_chunked_stable(factor_eval, dim, current_epsilon)
-            precisions = vectors_to_precision_chunked_optimized(factor_eval, dim, current_epsilon, 20)
+            precisions = vectors_to_precision_optimized(factor_eval, dim, current_epsilon)
             #print(f"✅ Precision construction time: {time.time() - t2:.4f} sec")
             del factor_eval
             torch.cuda.empty_cache()
@@ -1084,7 +1082,7 @@ def score_implicit_matching_stable(factornet, samples, centers, base_epsilon=1e-
                 continue
             else:
                 print("⚠️ Returning clamped fallback loss")
-                return torch.clamp(loss, min=-1e10, max=1e10).mean(dim=0)
+                return torch.clamp(loss, min=-1e6, max=1e6).mean(dim=0)
 
         except Exception as e:
             print(f"❌ Attempt {attempt + 1} failed with error: {e}")
@@ -1128,16 +1126,6 @@ def vectors_to_precision_optimized(vectors, dim, base_epsilon=1e-4):
     # Skip expensive eigendecomposition and use simpler validation
     # Most matrices will be positive definite after proper regularization
     return precision
-def vectors_to_precision_chunked_optimized(vectors, dim, epsilon=0.01,chunk_size=10):
-    results = []
-    for i in range(0, vectors.size(0), chunk_size):
-        chunk = vectors[i:i+chunk_size]
-        result = vectors_to_precision_optimized(chunk, dim, epsilon)
-        results.append(result)
-        # Memory cleanup
-        del chunk, result
-        torch.cuda.empty_cache()
-    return torch.cat(results, dim=0)
 
 def adaptive_regularization_fast(matrices, base_epsilon=1e-4, max_cond=1e12):
     """
@@ -1329,6 +1317,43 @@ def score_implicit_matching_optimized(factornet, samples, centers, base_epsilon=
     except RuntimeError as e:
         print(f"Optimization failed: {e}, falling back to stable version")
         # Fallback to your original stable version
+        return score_implicit_matching_stable(factornet, samples, centers, 
+                                            base_epsilon, temperature)
+
+def score_implicit_matching_fast_no_mixed_precision(factornet, samples, centers, 
+                                                   base_epsilon=1e-4, temperature=1.0):
+    """
+    Fast version without mixed precision - most reliable
+    """
+    dim = centers.shape[-1]
+    centers = centers.clone().detach().requires_grad_(True)
+    
+    try:
+        # Forward pass
+        factor_eval = factornet(centers)
+        
+        # Optimized precision computation
+        precisions = vectors_to_precision_optimized(factor_eval, dim, base_epsilon)
+        del factor_eval  # Early cleanup
+        
+        # Precompute terms for reuse
+        precomputed_terms = precompute_precision_terms(precisions)
+        
+        # Optimized gradient and Laplacian computation
+        gradient_eval_log, laplacian_over_density = grad_and_laplacian_mog_density_optimized(
+            samples, centers, precisions, temperature, precomputed_terms
+        )
+        
+        # Compute final loss efficiently
+        gradient_norm_squared = torch.sum(gradient_eval_log * gradient_eval_log, dim=1)
+        loss = 2 * laplacian_over_density - gradient_norm_squared
+        
+        return loss.mean()
+        
+    except RuntimeError as e:
+        print(f"Fast optimization failed: {e}, falling back to stable version")
+        # Import and use your original stable function
+        from your_original_module import score_implicit_matching_stable
         return score_implicit_matching_stable(factornet, samples, centers, 
                                             base_epsilon, temperature)
 
@@ -1646,7 +1671,7 @@ def scatter_samples_from_model(means, precisions, dim1, dim2, epoch = 0,plot_num
 
     return None
 
-def sample_from_model(factornet, means, sample_number, eps, use_stable=False):
+def sample_from_model(factornet, means, sample_number, eps):
     num_components, dim = means.shape
     comp_num = torch.randint(0, num_components, (sample_number,), device=means.device)
     samples = torch.empty(sample_number, dim, device=means.device)
@@ -1658,56 +1683,22 @@ def sample_from_model(factornet, means, sample_number, eps, use_stable=False):
         n_i = idx.shape[0]
         centers_i = means[i].unsqueeze(0).expand(n_i, -1)  # [n_i, dim]
 
+        # Get model output vectors (flattened Cholesky)
         vectors = factornet(centers_i)  # [n_i, d*(d+1)//2]
 
-        if use_stable:
-            precision = vectors_to_precision_stable(vectors, dim, eps)
-        else:
-            precision = vectors_to_precision(vectors, dim, 0.001)
-
+        # Use your existing function to get precision matrix with stabilization
+        #precision = vectors_to_precision_optimized(vectors, dim, eps)  # [n_i, dim, dim]
+        precision = vectors_to_precision(vectors, dim)
+        # Create multivariate normal with precision matrix
         mvn = MultivariateNormal(loc=centers_i, precision_matrix=precision)
+
+        # Sample from this distribution
         samples_i = mvn.rsample()  # [n_i, dim]
+
         samples[idx] = samples_i
 
     return samples
 
-def plot_images_with_model(factornet, means, plot_number=10, eps=1e-4, save_path=None):
-    dim = means.shape[-1]
-
-    # Get two sets of samples: standard and stable
-    samples1 = sample_from_model(factornet, means, plot_number, eps, use_stable=False)
-    samples2 = sample_from_model(factornet, means, plot_number, eps, use_stable=True)
-
-    # Denormalize using CIFAR-10 statistics
-    def format_samples(samples):
-        samples = samples.view(-1, 3, 32, 32)
-        samples = denormalize_cifar10(samples)
-        samples = torch.clamp(samples, 0, 1)
-        return samples
-
-    samples1 = format_samples(samples1)
-    samples2 = format_samples(samples2)
-
-    # Plot 2 rows: first row = standard, second row = stable
-    fig, axs = plt.subplots(2, plot_number, figsize=(plot_number * 1.5, 4))
-    for row, samples in enumerate([samples1, samples2]):
-        for i in range(plot_number):
-            img = samples[i].permute(1, 2, 0).cpu().numpy()
-            axs[row, i].imshow(img)
-
-            # Label the first image of each row
-            if i == 0:
-                axs[row, i].set_ylabel("Standard" if row == 0 else "Stable", fontsize=12)
-            else:
-                axs[row, i].set_yticks([])
-
-            axs[row, i].set_xticks([])
-            axs[row, i].tick_params(left=False, bottom=False)
-
-    if save_path is not None:
-        plt.savefig(save_path + '_sampled_images.png', bbox_inches='tight')
-    plt.close(fig)
-    return None
 
 def plot_images(means, precisions, plot_number = 10,  epoch = 0, save_path=None):
     # plots plot_number samples from the trained model for image data
@@ -1737,6 +1728,29 @@ def plot_images(means, precisions, plot_number = 10,  epoch = 0, save_path=None)
 
     return None
 
+def plot_images_with_model(factornet, means, plot_number = 10, eps=1e-4, save_path=None):
+    # plots plot_number samples from the trained model for image data
+    num_components = means.shape[0]
+    dim = means.shape[-1]
+    # sample from the multivariate normal distribution
+    comp_num = torch.randint(0, num_components, (1,plot_number)) #shape: [1, plot_number]
+    comp_num = comp_num.squeeze(0)  # shape: [plot_number]
+    samples = torch.empty(plot_number, dim, device=means.device)  # shape: [plot_number, d]
+    samples = sample_from_model(factornet, means, plot_number, eps)
+    # transform images back to original data 
+    samples = samples.view(-1, 3, 32, 32)
+    samples = samples * 0.5 + 0.5
+    samples = torch.clamp(samples, 0, 1)  # clip to [0, 1] to avoid warnings
+    fig, axs = plt.subplots(1, plot_number, figsize=(15, 2))
+    for i in range(plot_number):
+        img = samples[i].permute(1, 2, 0).cpu().numpy()  # change from [C, H, W] to [H, W, C]
+        axs[i].imshow(img)
+        axs[i].axis('off')
+    if save_path is not None:
+        save_path = save_path + '_sampled_images.png'
+        plt.savefig(save_path)
+    plt.close(fig)
+    return None
 def denormalize_cifar10(tensor):
     """
     Denormalizes a batch of CIFAR-10 images from standardized (mean=0, std=1)
@@ -1754,27 +1768,17 @@ def denormalize_cifar10(tensor):
 
 import torchvision.utils as vutils
 
-def plot_and_save_centers(centers, save_path, nrow=10, upscale_factor=8):
-    centers = centers.view(-1, 3, 32, 32)  # CIFAR-10 shape
-    centers = denormalize_cifar10(centers).clamp(0, 1)
+def plot_and_save_centers(centers, save_path, nrow=10):
+    centers = centers.view(-1, 3, 32, 32)  # reshape
+    centers = denormalize_cifar10(centers).clamp(0, 1)  # denormalize and clip to [0, 1]
 
-    # Create grid image
-    grid = vutils.make_grid(centers, nrow=nrow, padding=6)
-
-    # Upscale the grid using bilinear interpolation
-    grid = grid.unsqueeze(0)  # add batch dim for interpolation
-    height, width = grid.shape[2], grid.shape[3]
-    new_height = height * upscale_factor
-    new_width = width * upscale_factor
-    grid_upscaled = F.interpolate(grid, size=(new_height, new_width), mode='bilinear', align_corners=False).squeeze(0)
-
-    # Save upscaled image
+    grid = vutils.make_grid(centers, nrow=nrow, padding=2)
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    vutils.save_image(grid_upscaled, save_path)
-    print(f"Saved upscaled centers to {save_path}")
+    vutils.save_image(grid, save_path)
+    print(f"Saved centers to {save_path}")
 
-    # Show in matplotlib
-    plt.figure(figsize=(new_width / 100, new_height / 100), dpi=100)
+    # Optional preview
+    plt.figure(figsize=(nrow, nrow))
     plt.axis("off")
-    plt.imshow(grid_upscaled.permute(1, 2, 0).cpu().numpy())
+    plt.imshow(grid.permute(1, 2, 0).cpu().numpy())
     plt.show()

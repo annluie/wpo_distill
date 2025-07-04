@@ -35,7 +35,7 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingWarmResta
 #torch._dynamo.config.suppress_errors = True
 # ------------------- PROJECT MODULES -------------------
 from plots import *
-from WPO_SGM import functions_WPO_SGM as LearnCholesky
+from WPO_SGM import functions_WPO_SGM_stable as LearnCholesky
 from WPO_SGM import toy_data
 #from WPO_SGM import function_cpu as LearnCholesky
 
@@ -185,27 +185,31 @@ def setup_optimizer_and_scheduler(model, args, total_steps=None):
 #compiled_score = torch.compile(LearnCholesky.score_implicit_matching_optimized)
 #compiled_score = torch.compile(LearnCholesky.score_implicit_matching)
 
-def evaluate_model(factornet, kernel_centers, num_test_sample): 
-    '''
-    Evaluate the model by computing the average total loss over 10 batch of testing samples
-    '''
+def evaluate_model(factornet, kernel_centers, num_test_sample, num_batches=10):
+    """
+    Evaluate the model by computing the average total loss over `num_batches` of test samples.
+    Optimized to reduce data transfer and improve efficiency.
+    """
+    device = kernel_centers.device
+    total_loss_sum = 0.0
+
+    factornet.eval()  # Ensures no dropout, batchnorm updates
     with torch.no_grad():
-        total_loss_sum = 0
-        device = kernel_centers.device
-        for i in range(10):
-            p_samples = toy_data.inf_train_gen(dataset,batch_size = num_test_sample)
-            testing_samples = torch.as_tensor(p_samples, dtype=torch.float32, device=device)
-            #total_loss = compiled_score(factornet, testing_samples, kernel_centers)
-            #total_loss = LearnCholesky.score_implicit_matching(factornet, testing_samples, kernel_centers, stab)
-            total_loss = LearnCholesky.score_implicit_matching_stable(factornet, testing_samples, kernel_centers, stab)
-            #total_loss = LearnCholesky.score_implicit_matching_optimized(factornet, testing_samples, kernel_centers, stab)
-            total_loss_sum += total_loss.item()
-             # Free up memory
-            del p_samples, testing_samples, total_loss
-            gc.collect() #only if using CPU
-            torch.cuda.empty_cache()  # Only if using GPU
-        average_total_loss = total_loss_sum / 10
-    return average_total_loss
+        for _ in range(num_batches):
+            # Generate test samples directly on the correct device
+            p_samples = toy_data.inf_train_gen(dataset, batch_size=num_test_sample)
+            if not torch.is_tensor(p_samples):
+                p_samples = torch.tensor(p_samples, device=device, dtype=torch.float32)
+            else:
+                p_samples = p_samples.to(device=device, dtype=torch.float32, non_blocking=True)
+
+            # Evaluate loss
+            loss = LearnCholesky.score_implicit_matching_stable(
+                factornet, p_samples, kernel_centers, stab
+            )
+            total_loss_sum += loss.item()
+
+    return total_loss_sum / num_batches
 
 def opt_check(factornet, samples, centers, optimizer, scheduler=None, scheduler_type='one_cycle', stab=1e-6):
     optimizer.zero_grad(set_to_none=True)
@@ -275,7 +279,7 @@ def create_save_dir(save):
             f"centers{train_kernel_size}",
             f"batch_size{batch_size}_epochs{epochs}",
             #f"test_size{test_samples_size}",
-            f"lr{lr}_hu{hidden_units}_stab{stab}_stabveropt"
+            f"lr{lr}_hu{hidden_units}_stab{stab}_stabver"
             #f"test_size{test_samples_size}_lr{lr}_hu{hidden_units}_stab{stab}_comp"
             #f"lr{lr}_hu{hidden_units}_stab{stab}"
         )
@@ -286,7 +290,7 @@ def create_save_dir(save):
             f"centers{train_kernel_size}",
             f"batch_size{batch_size}_epochs{epochs}",
             #f"test_size{test_samples_size}",
-            f"lr{lr}_hu{hidden_units}_stab{stab}_stabveropt"
+            f"lr{lr}_hu{hidden_units}_stab{stab}_stabver"
             #f"test_size{test_samples_size}_lr{lr}_hu{hidden_units}_stab{stab}_comp"
             #f"lr{lr}_hu{hidden_units}_stab{stab}"
         )
@@ -317,7 +321,7 @@ def save_training_slice_log(iter_time, loss_time, epoch, max_mem, loss_value, sa
     Save the training log for the slice
     '''
     if save is not None:
-        logging.info(f"Training started for epoch {epoch} / {epochs}")
+        logging.info(f"Training started for epoch {epoch} / {total_steps}")
         logging.info(
         f"Step {epoch:04d} | Iter Time: {iter_time:.4f}s | "
         f"Loss Time: {loss_time:.4f}s | Loss: {loss_value:.6f} | "
@@ -347,9 +351,9 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--data', choices=['swissroll', '8gaussians', 'pinwheel', 'circles', 'moons', '2spirals', 'checkerboard', 'rings','swissroll_6D_xy1', 'cifar10'], type = str,default = 'cifar10')
 parser.add_argument('--depth',help = 'number of hidden layers of score network',type =int, default = 5)
 parser.add_argument('--hiddenunits',help = 'number of nodes per hidden layer', type = int, default = 64)
-parser.add_argument('--niters',type = int, default = 20)
+parser.add_argument('--niters',type = int, default = 1000)
 parser.add_argument('--batch_size', type = int,default = 8)
-parser.add_argument('--lr',type = float, default = 2e-3) 
+parser.add_argument('--lr',type = float, default = 1e-4) 
 parser.add_argument('--save',type = str,default = 'cifar10_experiments/')
 parser.add_argument('--train_kernel_size',type = int, default = 50)
 parser.add_argument('--train_samples_size',type = int, default = 500)
@@ -465,7 +469,7 @@ centers = training_samples[:train_kernel_size] # not random centers, with shuffl
 
 torch.save(centers, filename_final) #save the centers (we fix them in the beginning)
 filename_final = os.path.join(save_directory, 'centers.png')
-LearnCholesky.plot_and_save_centers(centers, filename_final)
+plot_and_save_centers(centers, filename_final)
 del p_samples
 # Call this before training
 if not check_model_gradients(factornet):
@@ -534,14 +538,14 @@ for step in trange(total_steps, desc="Training"):
             print("⚠️ Warning: Skipping LR scheduler step due to invalid val_loss:", loss0)
         # Sample and save generated images at intermediate steps
         with torch.no_grad():
-            generated = LearnCholesky.sample_from_model(factornet, training_samples, sample_number=10, eps=stab)
+            generated = sample_from_model(factornet, training_samples, sample_number=10, eps=stab)
             l2 = torch.mean((generated - training_samples[:10])**2).item()
             print(f"[Step {step}] L2 to training data: {l2:.2f}")
             logging.info(f"L2 {l2:.2f} | ")
     if step % 500 ==0:
         with torch.no_grad():
             filename_step_sample = os.path.join(save_directory, f"step{step:05d}")
-            LearnCholesky.plot_images_with_model(factornet, centers, plot_number=10, eps=stab, save_path=filename_step_sample)
+            plot_images_with_model(factornet, centers, plot_number=10, eps=stab, save_path=filename_step_sample)
             logging.info(f"Saved samples at step {step} to {filename_step_sample}")
     if step % 1000 == 0:
         save_training_slice_cov(factornet, centers, step, save_directory)
@@ -564,5 +568,5 @@ logging.info(f'After train, Average total_loss: {formatted_loss}')
 
 #---------------------------- Sample and save -------------------
 with torch.no_grad():
-    LearnCholesky.plot_images_with_model(factornet, centers, plot_number=10, eps=stab, save_path=save_directory)
+    plot_images_with_model(factornet, centers, plot_number=10, eps=stab, save_path=save_directory)
     logging.info(f'Sampled images saved to {save_directory}_sampled_images.png')
