@@ -7,6 +7,19 @@ from sklearn.utils import shuffle as util_shuffle
 import torch
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader
+import random
+
+# set a seed to get the same data every time
+def set_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    # Optional: For deterministic behavior (may impact performance)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
 
 # Dataset iterator
 def inf_train_gen(data, rng=None, batch_size=200):
@@ -161,11 +174,14 @@ def inf_train_gen(data, rng=None, batch_size=200):
             ])
             b = batch_size
             train_dataset = datasets.CIFAR10(root='./data', train=True, download=True, transform=transform)
-            train_loader = DataLoader(train_dataset, batch_size=b, shuffle=True, num_workers=1)
+            train_loader = DataLoader(train_dataset, batch_size=b, shuffle=False, num_workers=1)
 
         # Flatten one batch of images to [batch_size, 3072] for model input
         for images, _ in train_loader:
             flat_images = images.view(images.size(0), -1)
+            # flat_images: [batch_size, 3072]
+            #print("Mean:", flat_images.mean().item())
+            #print("Std:", flat_images.std().item())
             # flat_images: [batch_size, 3072]
             #print("Mean:", flat_images.mean().item())
             #print("Std:", flat_images.std().item())

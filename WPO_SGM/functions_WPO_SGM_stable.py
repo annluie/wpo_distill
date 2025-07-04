@@ -1,13 +1,15 @@
+#stable version of code
 import matplotlib.pyplot as plt
 import os
 import torch
 import torch.optim as optim
 import torch.nn as nn
 from torch.distributions.multivariate_normal import MultivariateNormal
+import lib.toy_data as toy_data
 import numpy as np
 import argparse
 from memory_profiler import profile
-from torch.amp.autocast_mode import autocast
+from torch.amp import autocast
 from torch.utils.checkpoint import checkpoint
 import torch.nn.functional as F
 import torch.linalg as LA
@@ -15,78 +17,21 @@ import torchvision.utils as vutils
 import time
 #import gc
 
+# ===================== #
+# Global Variables Config
+# ===================== #
+DEFAULT_EPSILON = 1e-4
+DEFAULT_MAX_COND = 1e12
+DEFAULT_MAX_ATTEMPTS = 3
+DEFAULT_CENTERS_CHUNK_SIZE = 5
+DEFAULT_BATCH_CHUNK_SIZE = 4
+DEFAULT_TEMPERATURE = 1.0
+DEFAULT_CLAMP = 100
+
 #----------------------------------------------#
-#### PRECISION MATRIX FUNCTIONS ####
+#### Precision Matrix Functions ####
 #----------------------------------------------#
-def vectors_to_precision(vectors,dim, epsilon=0.01):
-    """
-    Maps an array of 1xdim vectors into Cholesky factors and returns an array of precision matrices.
-    
-    Args:
-    vectors (torch.Tensor): A tensor of shape (batch_size, 1, dim), where each 1xdim tensor represents the
-                            lower triangular part of the Cholesky factor.
-    
-    Returns:
-    torch.Tensor: A tensor of shape (batch_size, dim, dim), containing the corresponding precision matrices.
-    """
-    batch_size = vectors.shape[0]
-    # Reshape the input vectors into lower triangular matrices
-    L = torch.zeros(batch_size, dim, dim, dtype=vectors.dtype, device=vectors.device)
-    indices = torch.tril_indices(dim, dim)
-    L[:, indices[0], indices[1]] = vectors.squeeze(1)
-    
-    # Construct the precision matrices using Cholesky factorization
-    C = torch.matmul(L, L.transpose(1, 2)) + epsilon * torch.eye(dim).to(vectors.device) # (add identity matrix to maintain positive definiteness)
-    
-    return C
-
-def vectors_to_precision_chunked(vectors, dim, epsilon=0.01,chunk_size=10):
-    results = []
-    for i in range(0, vectors.size(0), chunk_size):
-        chunk = vectors[i:i+chunk_size]
-        #results.append(vectors_to_precision(chunk, dim, epsilon))
-        results.append(vectors_to_precision_adapt(chunk, dim, epsilon))
-    return torch.cat(results, dim=0)
-
-def vectors_to_precision_adapt(vectors, dim, epsilon=0.1, min_reg=1e-4):
-    """
-    Converts Cholesky vectors to precision matrices with adaptive regularization.
-    """
-    batch_size = vectors.shape[0]
-    vectors = vectors.view(batch_size, -1)  # Safe squeeze
-    device, dtype = vectors.device, vectors.dtype
-
-    # Create lower-triangular matrix
-    L = torch.zeros(batch_size, dim, dim, dtype=dtype, device=device)
-    indices = torch.tril_indices(dim, dim, device=device)
-    L[:, indices[0], indices[1]] = vectors
-
-    # Ensure positive diagonal
-    diag = torch.diagonal(L, dim1=-2, dim2=-1)
-    L = L + torch.diag_embed(torch.abs(diag) + 1e-6 - diag)
-
-    # Build precision matrix
-    C = torch.bmm(L, L.transpose(-1, -2))
-
-    # Adaptive regularization
-    diag_C = torch.diagonal(C, dim1=-2, dim2=-1).mean(dim=-1)  # (B,)
-    trace_reg = epsilon * diag_C
-    reg = torch.maximum(trace_reg, torch.full_like(trace_reg, min_reg))  # (B,)
-
-    # Add per-sample regularization
-    identity = torch.eye(dim, device=device, dtype=dtype).expand(batch_size, -1, -1)
-    precision = C + reg.view(-1, 1, 1) * identity
-
-    # Final fallback (per sample)
-    for i in range(batch_size):
-        try:
-            _ = torch.linalg.cholesky(precision[i])
-        except RuntimeError:
-            precision[i] += 1e-3 * identity[i]
-
-    return precision
-
-def vectors_to_precision_stable(vectors, dim, base_epsilon=1e-4, max_cond=1e12):
+def vectors_to_precision_stable(vectors, dim, base_epsilon=DEFAULT_EPSILON, max_cond=DEFAULT_MAX_COND):
     """
     Enhanced and corrected version of vectors_to_precision with improved numerical stability
     """
@@ -114,7 +59,6 @@ def vectors_to_precision_stable(vectors, dim, base_epsilon=1e-4, max_cond=1e12):
     identity = torch.eye(dim, device=device, dtype=dtype)
     precision = C + adaptive_eps * identity
 
-    # Final safety check
     for attempt in range(3):
         try:
             torch.linalg.cholesky(precision)
@@ -125,7 +69,7 @@ def vectors_to_precision_stable(vectors, dim, base_epsilon=1e-4, max_cond=1e12):
 
     return precision
 
-def vectors_to_precision_chunked_stable(vectors, dim, base_epsilon=1e-4, chunk_size=10):
+def vectors_to_precision_chunked_stable(vectors, dim, base_epsilon=DEFAULT_EPSILON, chunk_size=DEFAULT_CENTERS_CHUNK_SIZE):
     """
     Chunked version of stable precision matrix computation
     """
@@ -141,7 +85,7 @@ def vectors_to_precision_chunked_stable(vectors, dim, base_epsilon=1e-4, chunk_s
     
     return torch.cat(results, dim=0)
 
-def vectors_to_precision_optimized(vectors, dim, base_epsilon=1e-4):
+def vectors_to_precision_optimized(vectors, dim, base_epsilon=DEFAULT_EPSILON):
     """
     Highly optimized version with minimal redundant operations
     """
@@ -175,21 +119,22 @@ def vectors_to_precision_optimized(vectors, dim, base_epsilon=1e-4):
     # Most matrices will be positive definite after proper regularization
     return precision
 
-def vectors_to_precision_chunked_optimized(vectors, dim, epsilon=0.01,chunk_size=20):
+def vectors_to_precision_chunked_optimized(vectors, dim, base_epsilon=DEFAULT_EPSILON, chunk_size=DEFAULT_CENTERS_CHUNK_SIZE):
     results = []
     for i in range(0, vectors.size(0), chunk_size):
         chunk = vectors[i:i+chunk_size]
-        result = vectors_to_precision_optimized(chunk, dim, epsilon)
+        result = vectors_to_precision_optimized(chunk, dim, base_epsilon)
         results.append(result)
         # Memory cleanup
         del chunk, result
         torch.cuda.empty_cache()
     return torch.cat(results, dim=0)
+
 #----------------------------------------------#
-#### STABILITY ENHANCEMENT FUNCTIONS ####
+#### Computation Functions ####
 #----------------------------------------------#
 
-def adaptive_regularization(matrices, base_epsilon=1e-4, max_cond=1e12):
+def adaptive_regularization(matrices, base_epsilon=DEFAULT_EPSILON, max_cond=DEFAULT_MAX_COND):
     """
     Compute adaptive regularization based on condition numbers
     """
@@ -205,7 +150,27 @@ def adaptive_regularization(matrices, base_epsilon=1e-4, max_cond=1e12):
         batch_size = matrices.shape[0]
         return torch.full((batch_size, 1, 1), base_epsilon, device=matrices.device, dtype=matrices.dtype)
 
-def stable_logdet(matrices, eps=1e-6, max_attempts=3):
+def adaptive_regularization_fast(matrices, base_epsilon=DEFAULT_EPSILON, max_cond=DEFAULT_MAX_COND):
+    """
+    Faster adaptive regularization using pre-computed condition estimates
+    """
+    batch_size = matrices.shape[0]
+    device = matrices.device
+    dtype = matrices.dtype
+    
+    try:
+        # Use Frobenius norm ratio as a fast condition number estimate
+        # This avoids expensive SVD in torch.linalg.cond
+        diag_norm = torch.norm(torch.diagonal(matrices, dim1=-2, dim2=-1), dim=-1)
+        frob_norm = torch.norm(matrices.view(batch_size, -1), dim=-1)
+        cond_estimate = torch.clamp(frob_norm / (diag_norm + 1e-8), 1.0, max_cond)
+        
+        adaptive_eps = base_epsilon * torch.sqrt(cond_estimate / 1e6)
+        return adaptive_eps.view(-1, 1, 1)  # Use view instead of unsqueeze
+    except:
+        return torch.full((batch_size, 1, 1), base_epsilon, device=device, dtype=dtype)
+
+def stable_logdet(matrices, eps=1e-6, max_attempts=DEFAULT_MAX_ATTEMPTS):
     """
     Compute log determinant with multiple fallback methods for stability
     """
@@ -249,9 +214,26 @@ def stable_softmax(logits, temperature=1.0, dim=-1, eps=1e-8):
     logits_stable = logits_scaled - logits_max
     
     # Clamp to prevent extreme values
-    logits_clamped = torch.clamp(logits_stable, min=-100, max=100)
+    logits_clamped = torch.clamp(logits_stable, min=-DEFAULT_CLAMP, max=DEFAULT_CLAMP)
     
     return F.softmax(logits_clamped, dim=dim)
+
+def stable_softmax_optimized(logits, temperature=1.0, dim=-1):
+    """
+    Optimized stable softmax with fewer operations
+    """
+    if temperature != 1.0:
+        logits = logits / temperature
+    
+    # Combined max subtraction and clamping
+    logits_max = torch.max(logits, dim=dim, keepdim=True)[0]
+    logits_stable = torch.clamp(logits - logits_max, min=-DEFAULT_CLAMP, max=DEFAULT_CLAMP)
+    
+    return F.softmax(logits_stable, dim=dim)
+
+#----------------------------------------------#
+#### Loss Functions ####
+#----------------------------------------------#
 
 def grad_and_laplacian_mog_density_stable(x, means, precisions, temperature=1.0):
     """
@@ -279,7 +261,7 @@ def grad_and_laplacian_mog_density_stable(x, means, precisions, temperature=1.0)
         torch.tensor(2 * torch.pi, device=x.device, dtype=x.dtype))
     
     # Clamp log probabilities to prevent extreme values
-    log_probs = torch.clamp(log_probs, min=-100, max=100)
+    log_probs = torch.clamp(log_probs, min=-DEFAULT_CLAMP, max=DEFAULT_CLAMP)
     
     # Compute stable softmax probabilities
     softmax_probs = stable_softmax(log_probs, temperature=temperature, dim=1)  # (B, K)
@@ -304,8 +286,8 @@ def grad_and_laplacian_mog_density_stable(x, means, precisions, temperature=1.0)
     return gradient, laplacian_over_density
 
 def grad_and_laplacian_mog_density_chunked_stable(x, means, precisions, 
-                                                  batch_chunk_size=16, 
-                                                  component_chunk_size=64,
+                                                  batch_chunk_size=DEFAULT_BATCH_CHUNK_SIZE, 
+                                                  component_chunk_size=DEFAULT_CENTERS_CHUNK_SIZE,
                                                   temperature=1.0):
     """
     Memory-efficient stable version with double chunking
@@ -334,7 +316,7 @@ def grad_and_laplacian_mog_density_chunked_stable(x, means, precisions,
     return torch.cat(gradients, dim=0), torch.cat(laplacians, dim=0)
 
 def grad_and_laplacian_mog_density_component_chunked_stable(x, means, precisions, 
-                                                           chunk_size=256, temperature=1.0):
+                                                           chunk_size=DEFAULT_CENTERS_CHUNK_SIZE, temperature=1.0):
     """
     Component-wise chunked stable computation
     """
@@ -421,20 +403,22 @@ def numerical_health_check(tensor, name="tensor"):
     if torch.any(torch.isinf(tensor)):
         print(f"Warning: Inf detected in {name}")
         return False
-    if torch.any(torch.abs(tensor) > 1e10):
+    if torch.any(torch.abs(tensor) > 1e12):
         print(f"Warning: Very large values detected in {name} (max: {torch.max(torch.abs(tensor))})")
         return False
     return True
 
-def score_implicit_matching_stable(factornet, samples, centers, base_epsilon=1e-4, 
-                                  temperature=1.0, max_attempts=3):
+def score_implicit_matching_stable(factornet, samples, centers, base_epsilon=DEFAULT_EPSILON, 
+                                  temperature=DEFAULT_TEMPERATURE, max_attempts=DEFAULT_MAX_ATTEMPTS):
     """
     Enhanced numerically stable version of score_implicit_matching with timing
     """
     torch.cuda.reset_peak_memory_stats()
     dim = centers.shape[-1]
     
-    centers = centers.clone().detach().requires_grad_(True)
+    # FIX: Since centers are fixed, don't make them require gradients
+    #centers = centers.clone().detach().requires_grad_(True)  # use this only for checkpoint
+    centers = centers.clone()  # Just clone for safety, no grad required
 
     for attempt in range(max_attempts):
         try:
@@ -450,6 +434,7 @@ def score_implicit_matching_stable(factornet, samples, centers, base_epsilon=1e-
                 factor_eval = factornet(centers)
             factor_eval = factor_eval.float()  # <-- cast back to float32 here
             '''
+            #factor_eval = checkpoint(factornet, centers, use_reentrant=False)
             factor_eval = factornet(centers)
             #print(f"✅ Factornet forward time: {time.time() - t1:.4f} sec")
 
@@ -461,7 +446,7 @@ def score_implicit_matching_stable(factornet, samples, centers, base_epsilon=1e-
             # === PRECISION CONSTRUCTION ===
             t2 = time.time()
             #precisions = vectors_to_precision_chunked_stable(factor_eval, dim, current_epsilon)
-            precisions = vectors_to_precision_optimized(factor_eval, dim, current_epsilon)
+            precisions = vectors_to_precision_chunked_optimized(factor_eval, dim, current_epsilon, 20)
             #print(f"✅ Precision construction time: {time.time() - t2:.4f} sec")
             del factor_eval
             torch.cuda.empty_cache()
@@ -505,81 +490,12 @@ def score_implicit_matching_stable(factornet, samples, centers, base_epsilon=1e-
                 continue
             else:
                 print("⚠️ Returning clamped fallback loss")
-                return torch.clamp(loss, min=-1e6, max=1e6).mean(dim=0)
+                return torch.clamp(loss, min=-1e10, max=1e10).mean(dim=0)
 
         except Exception as e:
             print(f"❌ Attempt {attempt + 1} failed with error: {e}")
             if attempt < max_attempts - 1:
                 print("Retrying with increased regularization...")
-
-#------------------------------------optimized versions --------------------------
-
-def adaptive_regularization_fast(matrices, base_epsilon=1e-4, max_cond=1e12):
-    """
-    Faster adaptive regularization using pre-computed condition estimates
-    """
-    batch_size = matrices.shape[0]
-    device = matrices.device
-    dtype = matrices.dtype
-    
-    try:
-        # Use Frobenius norm ratio as a fast condition number estimate
-        # This avoids expensive SVD in torch.linalg.cond
-        diag_norm = torch.norm(torch.diagonal(matrices, dim1=-2, dim2=-1), dim=-1)
-        frob_norm = torch.norm(matrices.view(batch_size, -1), dim=-1)
-        cond_estimate = torch.clamp(frob_norm / (diag_norm + 1e-8), 1.0, max_cond)
-        
-        adaptive_eps = base_epsilon * torch.sqrt(cond_estimate / 1e6)
-        return adaptive_eps.view(-1, 1, 1)  # Use view instead of unsqueeze
-    except:
-        return torch.full((batch_size, 1, 1), base_epsilon, device=device, dtype=dtype)
-
-def stable_softmax_optimized(logits, temperature=1.0, dim=-1):
-    """
-    Optimized stable softmax with fewer operations
-    """
-    if temperature != 1.0:
-        logits = logits / temperature
-    
-    # Combined max subtraction and clamping
-    logits_max = torch.max(logits, dim=dim, keepdim=True)[0]
-    logits_stable = torch.clamp(logits - logits_max, min=-50, max=50)
-    
-    return F.softmax(logits_stable, dim=dim)
-
-def precompute_precision_terms(precisions):
-    """
-    Precompute terms that are reused multiple times
-    """
-    # Compute log determinant once
-    logdet = stable_logdet_fast(precisions)
-    
-    # Compute trace once
-    trace_precision = torch.diagonal(precisions, dim1=-2, dim2=-1).sum(dim=-1)
-    
-    return logdet, trace_precision
-
-def stable_logdet_fast(matrices):
-    """
-    Faster stable log determinant computation
-    """
-    try:
-        # Try Cholesky first (fastest for PSD matrices)
-        L = torch.linalg.cholesky(matrices)
-        logdet = 2 * torch.sum(torch.log(torch.diagonal(L, dim1=-2, dim2=-1)), dim=-1)
-        return logdet
-    except RuntimeError:
-        # Fallback to LU decomposition
-        try:
-            LU, pivots = torch.linalg.lu_factor(matrices)
-            logdet = torch.sum(torch.log(torch.abs(torch.diagonal(LU, dim1=-2, dim2=-1))), dim=-1)
-            # Adjust for pivot sign
-            det_P = torch.det(torch.eye(matrices.shape[-1], device=matrices.device)[pivots])
-            logdet += torch.log(torch.abs(det_P))
-            return logdet
-        except RuntimeError:
-            # Conservative fallback
-            return torch.zeros(matrices.shape[0], device=matrices.device)
 
 def setup_optimal_device_settings():
     """
@@ -599,4 +515,3 @@ def setup_optimal_device_settings():
         # CPU optimizations
         torch.set_num_threads(torch.get_num_threads())
         print(f"Using {torch.get_num_threads()} CPU threads")
-    

@@ -8,12 +8,15 @@ from torch.distributions.multivariate_normal import MultivariateNormal
 import numpy as np
 import torch.nn.functional as F
 import torchvision.utils as vutils
-from WPO_SGM.functions_WPO_SGM import vectors_to_precision, vectors_to_precision_stable
-
+from WPO_SGM.functions_WPO_SGM_stable import vectors_to_precision_stable
+from WPO_SGM.functions_WPO_SGM import vectors_to_precision
 def sample_from_model(factornet, means, sample_number, eps, use_stable=False):
     num_components, dim = means.shape
-    comp_num = torch.randint(0, num_components, (sample_number,), device=means.device)
-    samples = torch.empty(sample_number, dim, device=means.device)
+    device = means.device
+    dtype = means.dtype
+
+    comp_num = torch.randint(0, num_components, (sample_number,), device=device)
+    samples = torch.empty(sample_number, dim, device=device, dtype=dtype)
 
     unique_indices = comp_num.unique()
 
@@ -24,10 +27,18 @@ def sample_from_model(factornet, means, sample_number, eps, use_stable=False):
 
         vectors = factornet(centers_i)  # [n_i, d*(d+1)//2]
 
-        if use_stable:
-            precision = vectors_to_precision_stable(vectors, dim, eps)
-        else:
-            precision = vectors_to_precision(vectors, dim, 0.001)
+        # Choose precision method
+        try:
+            if use_stable:
+                precision = vectors_to_precision_stable(vectors, dim, eps)
+            else:
+                precision = vectors_to_precision(vectors, dim, 0.001)
+
+            # Check positive definiteness
+            torch.linalg.cholesky(precision)
+        except RuntimeError:
+            print("⚠️ Precision matrix not PD, using fallback identity.")
+            precision = torch.eye(dim, device=device, dtype=dtype).unsqueeze(0).repeat(n_i, 1, 1)
 
         mvn = MultivariateNormal(loc=centers_i, precision_matrix=precision)
         samples_i = mvn.rsample()  # [n_i, dim]
