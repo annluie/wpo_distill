@@ -11,6 +11,10 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 # Add these environment variables for better DDP performance
 os.environ["NCCL_BLOCKING_WAIT"] = "1"
 os.environ["NCCL_ASYNC_ERROR_HANDLING"] = "1"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+# Add these environment variables for better DDP performance
+os.environ["NCCL_BLOCKING_WAIT"] = "1"
+os.environ["NCCL_ASYNC_ERROR_HANDLING"] = "1"
 # ------------------- TIME & LOGGING -------------------
 import time
 import gc
@@ -37,6 +41,9 @@ import torch.distributed as dist
 import torch._dynamo
 torch._dynamo.config.suppress_errors = True
 # ------------------- PROJECT MODULES -------------------
+from plots import *
+#from WPO_SGM import functions_WPO_SGM as LearnCholesky
+from WPO_SGM import functions_WPO_SGM_ddp as LearnCholesky
 from plots import *
 #from WPO_SGM import functions_WPO_SGM as LearnCholesky
 from WPO_SGM import functions_WPO_SGM_ddp as LearnCholesky
@@ -196,6 +203,10 @@ compiled_loss = torch.compile(
         LearnCholesky.score_implicit_matching_ddp_optimized, 
         mode="reduce-overhead"  # Better for training loops
     )
+compiled_loss = torch.compile(
+        LearnCholesky.score_implicit_matching_ddp_optimized, 
+        mode="reduce-overhead"  # Better for training loops
+    )
 def evaluate_model(factornet, kernel_centers, num_test_sample, dataset, stab, world_size): 
     '''
     Evaluate the model by computing the average total loss over 10 batch of testing samples
@@ -206,6 +217,10 @@ def evaluate_model(factornet, kernel_centers, num_test_sample, dataset, stab, wo
         for i in range(10):
             p_samples = toy_data.inf_train_gen(dataset, batch_size=num_test_sample)
             testing_samples = torch.as_tensor(p_samples, dtype=torch.float32, device=device)
+            #total_loss = LearnCholesky.score_implicit_matching_stable(factornet, testing_samples, kernel_centers, stab)
+            #total_loss = LearnCholesky.score_implicit_matching_ddp_optimized(factornet, testing_samples, kernel_centers, stab)
+            total_loss = compiled_loss(factornet, testing_samples, kernel_centers, stab)
+
             #total_loss = LearnCholesky.score_implicit_matching_stable(factornet, testing_samples, kernel_centers, stab)
             #total_loss = LearnCholesky.score_implicit_matching_ddp_optimized(factornet, testing_samples, kernel_centers, stab)
             total_loss = compiled_loss(factornet, testing_samples, kernel_centers, stab)
@@ -226,6 +241,8 @@ def opt_check(factornet, samples, centers, optimizer, stab):
     Optimization function that computes the loss and performs backpropagation using mixed precision
     '''
     optimizer.zero_grad(set_to_none=True)
+    #loss = LearnCholesky.score_implicit_matching_stable(factornet, samples, centers, stab)
+    loss = LearnCholesky.score_implicit_matching_ddp_optimized(factornet, samples, centers, stab)
     #loss = LearnCholesky.score_implicit_matching_stable(factornet, samples, centers, stab)
     loss = LearnCholesky.score_implicit_matching_ddp_optimized(factornet, samples, centers, stab)
     torch.autograd.set_detect_anomaly(True)
@@ -260,7 +277,34 @@ class DataBuffer:
         indices = self.precomputed_indices[epoch]
         return self.training_samples[indices]
 
+# Pre-generate training data to avoid repeated generation
+class DataBuffer:
+    def __init__(self, dataset, total_samples, device, world_size, rank):
+        self.dataset = dataset
+        self.device = device
+        self.world_size = world_size
+        self.rank = rank
+        
+        # Pre-generate all training data
+        torch.manual_seed(42)  # Consistent across ranks
+        all_samples = toy_data.inf_train_gen(dataset, batch_size=total_samples)
+        self.training_samples = all_samples.clone().detach().to(dtype=torch.float32, device=device)
+        
+        # Pre-compute random indices for each epoch to avoid repeated randint calls
+        self.precomputed_indices = {}
+        
+    def get_batch(self, epoch, batch_size):
+        if epoch not in self.precomputed_indices:
+            torch.manual_seed(epoch * self.world_size + self.rank)
+            self.precomputed_indices[epoch] = torch.randint(
+                0, len(self.training_samples), [batch_size]
+            )
+        
+        indices = self.precomputed_indices[epoch]
+        return self.training_samples[indices]
+
 #----------------------- SAVE FUNCTIONS -------------------
+def create_save_dir(save, train_samples_size, test_samples_size, total_batch_size, train_kernel_size, lr, hidden_units, stab):
 def create_save_dir(save, train_samples_size, test_samples_size, total_batch_size, train_kernel_size, lr, hidden_units, stab):
     '''
     Create a subfolder to save all the outputs
@@ -271,6 +315,7 @@ def create_save_dir(save, train_samples_size, test_samples_size, total_batch_siz
             f"sample_size{train_samples_size}",
             f"test_size{test_samples_size}",
             f"batch_size{total_batch_size}",
+            f"batch_size{total_batch_size}",
             f"centers{train_kernel_size}",
             f"lr{lr}_hu{hidden_units}_stab{stab}_ddp"
         )
@@ -279,6 +324,7 @@ def create_save_dir(save, train_samples_size, test_samples_size, total_batch_siz
         subfolder = os.path.join(
             f"sample_size{train_samples_size}",
             f"test_size{test_samples_size}",
+            f"batch_size{total_batch_size}",
             f"batch_size{total_batch_size}",
             f"centers{train_kernel_size}",
             f"lr{lr}_hu{hidden_units}_stab{stab}_ddp"
@@ -335,6 +381,7 @@ def main_worker(rank, world_size, args):
     # ------------------- SET PARAMETERS -------------------
     torch.set_float32_matmul_precision('high')
     LearnCholesky.setup_optimal_device_settings_ddp()
+    LearnCholesky.setup_optimal_device_settings_ddp()
     
     # Extract parameters from args
     train_kernel_size = args.train_kernel_size
@@ -342,6 +389,9 @@ def main_worker(rank, world_size, args):
     test_samples_size = args.test_samples_size
     dataset = args.data 
     epochs = args.niters
+    #batch_size = args.batch_size #need to distribute batches over ddp to prevent OOM (DP does this automatic)
+    total_batch_size = args.batch_size
+    batch_size = args.batch_size // world_size
     #batch_size = args.batch_size #need to distribute batches over ddp to prevent OOM (DP does this automatic)
     total_batch_size = args.batch_size
     batch_size = args.batch_size // world_size
@@ -366,6 +416,7 @@ def main_worker(rank, world_size, args):
     #-------------------- Create Save Directory (only on rank 0) -------------------
     if rank == 0:
         save_directory = create_save_dir(save_directory, train_samples_size, test_samples_size, 
+                                       total_batch_size, train_kernel_size, lr, hidden_units, stab)
                                        total_batch_size, train_kernel_size, lr, hidden_units, stab)
         print('save_directory', save_directory)
         if not os.path.exists(save_directory):
@@ -423,8 +474,17 @@ def main_worker(rank, world_size, args):
         broadcast_buffers=False,       # Skip if no buffers need syncing
         static_graph=True             # Graph doesn't change
     )
+    factornet = DDP(
+        factornet, 
+        device_ids=[rank],
+        find_unused_parameters=False,  # Important optimization
+        gradient_as_bucket_view=True,  # Memory optimization
+        broadcast_buffers=False,       # Skip if no buffers need syncing
+        static_graph=True             # Graph doesn't change
+    )
     
     # Optional: compile the model (after DDP wrapping)
+    #factornet = torch.compile(factornet, mode="max-autotune")
     #factornet = torch.compile(factornet, mode="max-autotune")
 
     #------------------------ Initialize the optimizer -------------------
@@ -439,7 +499,9 @@ def main_worker(rank, world_size, args):
         cooldown=2,
         min_lr=1e-7,
         #verbose=(rank == 0)  # Only verbose on rank 0
+        #verbose=(rank == 0)  # Only verbose on rank 0
     )
+    '''
     '''
     # Generate training samples (same seed for consistency)
     torch.manual_seed(42)
@@ -448,7 +510,11 @@ def main_worker(rank, world_size, args):
     '''
     data_buffer = DataBuffer(dataset, train_samples_size, device, world_size, rank)
     training_samples = data_buffer.get_batch(0, train_samples_size)
+    '''
+    data_buffer = DataBuffer(dataset, train_samples_size, device, world_size, rank)
+    training_samples = data_buffer.get_batch(0, train_samples_size)
     # Save centers (only on rank 0)
+    '''
     '''
     if rank == 0:
         filename_final = os.path.join(save_directory, 'centers.pt')
@@ -463,11 +529,20 @@ def main_worker(rank, world_size, args):
         torch.save(centers, centers_file)
         filename_final = os.path.join(save_directory, 'centers.png')
         LearnCholesky.plot_and_save_centers(centers, filename_final)
+    #del p_samples
+    '''
+    if rank == 0:
+        centers_file = os.path.join(save_directory, 'centers.pt')
+        torch.save(centers, centers_file)
+        filename_final = os.path.join(save_directory, 'centers.png')
+        LearnCholesky.plot_and_save_centers(centers, filename_final)
     ###########################
     # Training loop
     ###########################
     gc.collect()
     torch.cuda.empty_cache()
+    #compiled_opt_check = torch.compile(opt_check, mode="reduce-overhead")
+    compiled_opt_check = opt_check
     #compiled_opt_check = torch.compile(opt_check, mode="reduce-overhead")
     compiled_opt_check = opt_check
     # Use trange only on rank 0
@@ -480,6 +555,7 @@ def main_worker(rank, world_size, args):
         torch.cuda.reset_peak_memory_stats()
         
         '''
+        '''
         # Generate different random indices for each process
         torch.manual_seed(step * world_size + rank)  # Different seed per process
         randind = torch.randint(0, train_samples_size, [batch_size,])
@@ -488,7 +564,13 @@ def main_worker(rank, world_size, args):
         # Get batch from buffer (much faster than repeated generation)
         samples = data_buffer.get_batch(step, batch_size)
 
+        '''
+        # Get batch from buffer (much faster than repeated generation)
+        samples = data_buffer.get_batch(step, batch_size)
+
         iter_start = time.time()
+        #loss = opt_check(factornet, samples, centers, optimizer, stab)
+        loss = compiled_opt_check(factornet, samples, centers, optimizer, stab)
         #loss = opt_check(factornet, samples, centers, optimizer, stab)
         loss = compiled_opt_check(factornet, samples, centers, optimizer, stab)
         loss_value = loss.item()
@@ -542,7 +624,9 @@ def main_worker(rank, world_size, args):
                 with torch.no_grad():
                     filename_step_sample = os.path.join(save_directory, f"step{step:05d}")
                     LearnCholesky.plot_images_with_model(factornet, centers, plot_number=10, eps=stab, save_path=filename_step_sample)
+                    LearnCholesky.plot_images_with_model(factornet, centers, plot_number=10, eps=stab, save_path=filename_step_sample)
                     logging.info(f"Saved samples at step {step} to {filename_step_sample}")
+                    generated = LearnCholesky.sample_from_model(factornet, training_samples, sample_number=10, eps=stab)
                     generated = LearnCholesky.sample_from_model(factornet, training_samples, sample_number=10, eps=stab)
                     l2 = torch.mean((generated - training_samples[:10])**2).item()
                     print(f"[Step {step}] L2 to training data: {l2:.2f}")
@@ -609,3 +693,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+

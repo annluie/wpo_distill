@@ -37,6 +37,7 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingWarmResta
 from plots import *
 from WPO_SGM import functions_WPO_SGM as LearnCholesky
 from WPO_SGM import toy_data
+from WPO_SGM import toy_data
 #from WPO_SGM import function_cpu as LearnCholesky
 
 ###################
@@ -208,8 +209,32 @@ def evaluate_model(factornet, kernel_centers, num_test_sample):
     return average_total_loss
 
 def opt_check(factornet, samples, centers, optimizer, scheduler=None, scheduler_type='one_cycle', stab=1e-6):
+def opt_check(factornet, samples, centers, optimizer, scheduler=None, scheduler_type='one_cycle', stab=1e-6):
     optimizer.zero_grad(set_to_none=True)
     loss = LearnCholesky.score_implicit_matching_stable(factornet, samples, centers, stab)
+    
+    # Only print debug info occasionally or when there's an issue
+    if torch.isnan(loss) or torch.isinf(loss) or not loss.requires_grad:
+        print(f"⚠️ Loss issue detected: {loss}")
+        print(f"Loss requires_grad: {loss.requires_grad}")
+        print(f"Loss grad_fn: {loss.grad_fn}")
+    
+    if loss.requires_grad and loss.grad_fn is not None:
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(factornet.parameters(), max_norm=100.0)
+        optimizer.step()
+        # Update scheduler if provided
+        if scheduler is not None:
+            if scheduler_type == 'reduce_on_plateau':
+                # Don't step here - will be called with validation loss
+                pass
+            elif scheduler_type in ['cosine_annealing', 'one_cycle']:
+                scheduler.step()
+            else:
+                scheduler.step()
+    else:
+        print("❌ Gradient flow broken!")
+        
     
     # Only print debug info occasionally or when there's an issue
     if torch.isnan(loss) or torch.isinf(loss) or not loss.requires_grad:
@@ -263,6 +288,34 @@ def print_memory_usage(step):
           f"Reserved: {reserved:.2f}GB | "
           f"Max: {max_allocated:.2f}GB")
 
+def check_model_gradients(model):
+    total_params = 0
+    trainable_params = 0
+    
+    for name, param in model.named_parameters():
+        total_params += param.numel()
+        if param.requires_grad:
+            trainable_params += param.numel()
+        else:
+            print(f"Non-trainable parameter: {name}, shape: {param.shape}")
+    
+    print(f"Total parameters: {total_params}")
+    print(f"Trainable parameters: {trainable_params}")
+    return trainable_params > 0
+
+def print_memory_usage(step):
+    """Print detailed memory usage for all GPUs"""
+    num_gpus = torch.cuda.device_count()
+    print(f"Memory usage at step {step}:")
+    for device_id in range(num_gpus):
+        allocated = torch.cuda.memory_allocated(device_id) / 2**30  # GB
+        reserved = torch.cuda.memory_reserved(device_id) / 2**30   # GB
+        max_allocated = torch.cuda.max_memory_allocated(device_id) / 2**30  # GB
+        print(f"GPU {device_id} Step {step:04d} | "
+          f"Allocated: {allocated:.2f}GB | "
+          f"Reserved: {reserved:.2f}GB | "
+          f"Max: {max_allocated:.2f}GB")
+
 #----------------------- SAVE FUNCTIONS -------------------
 def create_save_dir(save):
     '''
@@ -277,6 +330,7 @@ def create_save_dir(save):
             #f"test_size{test_samples_size}",
             f"lr{lr}_hu{hidden_units}_stab{stab}_stabveropt"
             #f"test_size{test_samples_size}_lr{lr}_hu{hidden_units}_stab{stab}_comp"
+            #f"test_size{test_samples_size}_lr{lr}_hu{hidden_units}_stab{stab}_comp"
             #f"lr{lr}_hu{hidden_units}_stab{stab}"
         )
         os.makedirs(subfolder, exist_ok=True)
@@ -287,6 +341,7 @@ def create_save_dir(save):
             f"batch_size{batch_size}_epochs{epochs}",
             #f"test_size{test_samples_size}",
             f"lr{lr}_hu{hidden_units}_stab{stab}_stabveropt"
+            #f"test_size{test_samples_size}_lr{lr}_hu{hidden_units}_stab{stab}_comp"
             #f"test_size{test_samples_size}_lr{lr}_hu{hidden_units}_stab{stab}_comp"
             #f"lr{lr}_hu{hidden_units}_stab{stab}"
         )
@@ -334,6 +389,7 @@ if torch.cuda.is_available():
     print(f"Using {len(devices)} GPUs with DataParallel: {devices}")
 else:
     devices = []
+    devices = []
     device = torch.device('cpu')
 #device = torch.device('cpu')
 
@@ -361,6 +417,10 @@ parser.add_argument('--weight_decay', type=float, default = 1e-4)
 parser.add_argument('--scheduler_type', type=str, default='one_cycle',
                     choices=['reduce_on_plateau', 'cosine_annealing', 'one_cycle', 'step'],
                     help='Type of LR scheduler to use')
+parser.add_argument('--weight_decay', type=float, default = 1e-4)
+parser.add_argument('--scheduler_type', type=str, default='one_cycle',
+                    choices=['reduce_on_plateau', 'cosine_annealing', 'one_cycle', 'step'],
+                    help='Type of LR scheduler to use')
 args = parser.parse_args()
 
 # set parameters from args
@@ -379,11 +439,14 @@ load_centers_path = args.load_centers_path
 stab = args.stability
 weight_decay = args.weight_decay
 scheduler_type = args.scheduler_type
+weight_decay = args.weight_decay
+scheduler_type = args.scheduler_type
 
 #-------------------- Initialize Data -------------------
 # check the dataset
 if dataset not in ['swissroll', '8gaussians', 'pinwheel', 'circles', 'moons', '2spirals', 'checkerboard', 'rings','swissroll_6D_xy1', 'cifar10']:
     dataset = 'cifar10'
+means  = toy_data.inf_train_gen(dataset, batch_size = train_kernel_size).clone().detach().to(dtype=torch.float32, device=device) # type: ignore
 means  = toy_data.inf_train_gen(dataset, batch_size = train_kernel_size).clone().detach().to(dtype=torch.float32, device=device) # type: ignore
 data_dim = means.shape[1]
 del means
@@ -413,7 +476,10 @@ logging.info(f"-----------------------------------------------------------------
 #------------------------ Initialize the model -------------------
 factornet = construct_factor_model(data_dim, depth, hidden_units).to(device).to(dtype = torch.float32)
 centers = toy_data.inf_train_gen(dataset, batch_size=train_kernel_size).clone().detach().to(dtype=torch.float32, device=device) # type: ignore
+centers = toy_data.inf_train_gen(dataset, batch_size=train_kernel_size).clone().detach().to(dtype=torch.float32, device=device) # type: ignore
 #factornet = nn.DataParallel(factornet, device_ids=devices)
+#Load model and centers if specified
+#factornet = torch.compile(factornet, mode="reduce-overhead") # must be compiled before DataParallel
 #Load model and centers if specified
 #factornet = torch.compile(factornet, mode="reduce-overhead") # must be compiled before DataParallel
 if load_model_path or load_centers_path:
@@ -424,6 +490,8 @@ if load_model_path or load_centers_path:
         os.makedirs(new_dir)
     save_directory = new_dir  # ✅ Set after creation
     factornet, centers = load_model(factornet, centers, load_model_path, load_centers_path)
+if devices:
+    factornet = nn.DataParallel(factornet, device_ids=devices) # Wrap model in DataParallel, must be done after loading the model
 if devices:
     factornet = nn.DataParallel(factornet, device_ids=devices) # Wrap model in DataParallel, must be done after loading the model
 
@@ -453,9 +521,12 @@ scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
     cooldown=2,
     min_lr=1e-7,
     #verbose=True
+    #verbose=True
 )
 '''
+'''
 p_samples = toy_data.inf_train_gen(dataset,batch_size = train_samples_size)
+training_samples = p_samples.clone().detach().to(dtype=torch.float32, device=device) # type: ignore
 training_samples = p_samples.clone().detach().to(dtype=torch.float32, device=device) # type: ignore
 
 filename_final = os.path.join(save_directory, 'centers.pt')
@@ -467,6 +538,9 @@ torch.save(centers, filename_final) #save the centers (we fix them in the beginn
 filename_final = os.path.join(save_directory, 'centers.png')
 LearnCholesky.plot_and_save_centers(centers, filename_final)
 del p_samples
+# Call this before training
+if not check_model_gradients(factornet):
+    print("ERROR: No trainable parameters found!")
 # Call this before training
 if not check_model_gradients(factornet):
     print("ERROR: No trainable parameters found!")
@@ -485,6 +559,7 @@ for step in trange(total_steps, desc="Training"):
     iter_start = time.time()
     # with torch.autograd.detect_anomaly():
     loss = compiled_opt_check(factornet, samples, centers, optimizer, scheduler=scheduler, scheduler_type=scheduler_type, stab=stab)
+    loss = compiled_opt_check(factornet, samples, centers, optimizer, scheduler=scheduler, scheduler_type=scheduler_type, stab=stab)
     loss_value = loss.item()
     if torch.isnan(loss) or torch.isinf(loss):
         print(f"Invalid loss (NaN or Inf) at step {step}. Exiting.")
@@ -493,6 +568,7 @@ for step in trange(total_steps, desc="Training"):
     iter_time = iter_end - iter_start
     max_mem = torch.cuda.max_memory_allocated() / 2**30  # in GiB
     #print(f"Peak memory usage: {max_mem} GiB")
+    #print_memory_usage(step)
     #print_memory_usage(step)
     '''
     for device_id in [0, 1]:  # assuming 2 GPUs: cuda:0 and cuda:1

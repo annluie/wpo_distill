@@ -182,6 +182,9 @@ def inf_train_gen(data, rng=None, batch_size=200):
             # flat_images: [batch_size, 3072]
             #print("Mean:", flat_images.mean().item())
             #print("Std:", flat_images.std().item())
+            # flat_images: [batch_size, 3072]
+            #print("Mean:", flat_images.mean().item())
+            #print("Std:", flat_images.std().item())
             break
         return flat_images
     else:
