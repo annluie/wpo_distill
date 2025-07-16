@@ -8,8 +8,130 @@ from torch.distributions.multivariate_normal import MultivariateNormal
 import numpy as np
 import torch.nn.functional as F
 import torchvision.utils as vutils
-from WPO_SGM.functions_WPO_SGM_stable import vectors_to_precision_stable
+from WPO_SGM.functions_WPO_SGM_stable import vectors_to_precision_optimized_new
 from WPO_SGM.functions_WPO_SGM import vectors_to_precision
+from torchvision.datasets import CIFAR10
+from torchvision import transforms
+
+def load_cifar10_training_tensor(device='cpu'):
+    transform = transforms.ToTensor()
+    dataset = CIFAR10(root="./data", train=True, download=True, transform=transform)
+    images = torch.stack([img for img, _ in dataset])  # [50000, 3, 32, 32]
+    return images.to(device)
+
+@torch.no_grad()
+def compute_min_l2_per_sample(generated_batch, training_batch):
+    """
+    Compute the minimum L2 distance from each generated image to any image in the training set.
+    Args:
+        generated_batch: [B, 3, 32, 32]
+        training_batch: [N, 3, 32, 32]
+    Returns:
+        Tensor of shape [B] with min L2 distances
+    """
+    B = generated_batch.shape[0]
+    gen_flat = generated_batch.view(B, -1)  # [B, 3072]
+    train_flat = training_batch.view(training_batch.shape[0], -1)  # [N, 3072]
+    dists = torch.cdist(gen_flat, train_flat, p=2.0)  # [B, N]
+    min_l2 = torch.min(dists, dim=1)[0]  # [B]
+    return min_l2
+
+import matplotlib.pyplot as plt
+
+@torch.no_grad()
+def visualize_nn_matches(generated, training, num_show=10, save_path=None):
+    """
+    Plots each generated image next to its nearest training image.
+
+    Args:
+        generated: [B, 3, 32, 32] tensor (already denormalized and clamped to [0, 1])
+        training: [N, 3, 32, 32] tensor (CIFAR-10 training data)
+        num_show: how many to visualize
+        save_path: optional file path to save the figure
+    """
+    B = generated.shape[0]
+    assert num_show <= B, "num_show exceeds number of generated samples"
+
+    gen_flat = generated.view(B, -1)  # [B, D]
+    train_flat = training.view(training.shape[0], -1)  # [N, D]
+    dists = torch.cdist(gen_flat, train_flat, p=2.0)  # [B, N]
+    nn_indices = dists.argmin(dim=1)  # [B]
+
+    fig, axs = plt.subplots(2, num_show, figsize=(num_show * 2, 4))
+    for i in range(num_show):
+        # Generated image
+        axs[0, i].imshow(generated[i].permute(1, 2, 0).cpu().numpy())
+        axs[0, i].axis('off')
+        if i == 0:
+            axs[0, i].set_ylabel("Generated", fontsize=12)
+
+        # Nearest neighbor in CIFAR-10
+        nn_img = training[nn_indices[i]]
+        axs[1, i].imshow(nn_img.permute(1, 2, 0).cpu().numpy())
+        axs[1, i].axis('off')
+        if i == 0:
+            axs[1, i].set_ylabel("Nearest Train", fontsize=12)
+
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, bbox_inches="tight")
+        print(f"🔍 Saved NN visualization to {save_path}")
+    plt.show()
+
+def plot_images_with_model_and_nn(factornet, means, training_data_tensor, plot_number=10, eps=1e-4, save_path=None):
+    dim = means.shape[-1]
+
+    # Get two sets of samples: standard and stable
+    samples_standard = sample_from_model(factornet, means, plot_number, eps, use_stable=False)
+    samples_stable = sample_from_model(factornet, means, plot_number, eps, use_stable=True)
+
+
+    # Compute NN matches for stable samples
+    with torch.no_grad():
+        gen_flat = samples_stable.view(plot_number, -1)              # [B, 3072]
+        train_flat = training_data_tensor.view(training_data_tensor.size(0), -1)  # [N, 3072]
+        dists = torch.cdist(gen_flat, train_flat, p=2.0)             # [B, N]
+        nn_indices = torch.argmin(dists, dim=1)                      # [B]
+        nn_matches = training_data_tensor[nn_indices]                # [B, 3, 32, 32]
+    '''
+    print(f"NN indices: {nn_indices}")
+    print(f"Unique NN indices: {nn_indices.unique()}")
+    print(f"Number of unique matches: {len(nn_indices.unique())}")
+    '''
+    # Format and denormalize sampled images
+    def format_samples(samples):
+        samples = samples.view(-1, 3, 32, 32)
+        samples = denormalize_cifar10(samples)
+        return torch.clamp(samples, 0, 1)
+
+    samples_standard = format_samples(samples_standard)
+    samples_stable = format_samples(samples_stable)
+    nn_matches = format_samples(nn_matches)
+
+    # Plot 3 rows: standard, stable, NN matches
+    all_samples = [samples_standard, samples_stable, nn_matches]
+    labels = ["Standard", "Stable", "NN in Train"]
+
+    fig, axs = plt.subplots(3, plot_number, figsize=(plot_number * 1.5, 6))
+    axs = np.atleast_2d(axs)  # Ensures axs[row, i] indexing works
+
+    for row, (samples, label) in enumerate(zip(all_samples, labels)):
+        for i in range(plot_number):
+            img = samples[i].permute(1, 2, 0).cpu().numpy()
+            axs[row, i].imshow(img)
+            axs[row, i].set_xticks([])
+            axs[row, i].set_yticks([])
+            for spine in axs[row, i].spines.values():
+                spine.set_visible(False)
+            if i == 0:
+                axs[row, i].set_ylabel(label, fontsize=12)
+    plt.tight_layout(pad=0.5)  # Minimal padding
+    if save_path is not None:
+        save_file = save_path + '_sampled_images_with_nn.png'
+        plt.savefig(save_file, bbox_inches='tight')
+        print(f"✅ Saved to {save_file}")
+    plt.close(fig)
+
 def sample_from_model(factornet, means, sample_number, eps, use_stable=False):
     num_components, dim = means.shape
     device = means.device
@@ -30,9 +152,9 @@ def sample_from_model(factornet, means, sample_number, eps, use_stable=False):
         # Choose precision method
         try:
             if use_stable:
-                precision = vectors_to_precision_stable(vectors, dim, eps)
+                precision = vectors_to_precision_optimized_new(vectors, dim, eps)
             else:
-                precision = vectors_to_precision(vectors, dim, 0.001)
+                precision = vectors_to_precision(vectors, dim, eps)
 
             # Check positive definiteness
             torch.linalg.cholesky(precision)
@@ -343,4 +465,3 @@ def scatter_samples_from_model(means, precisions, dim1, dim2, epoch = 0,plot_num
     plt.close(fig)
 
     return None
-

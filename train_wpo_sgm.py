@@ -37,7 +37,6 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingWarmResta
 from plots import *
 from WPO_SGM import functions_WPO_SGM as LearnCholesky
 from WPO_SGM import toy_data
-from WPO_SGM import toy_data
 #from WPO_SGM import function_cpu as LearnCholesky
 
 ###################
@@ -111,6 +110,15 @@ def load_model(model, centers, load_model_path, load_centers_path):
         print(f"No model loaded. Path does not exist: {load_model_path}")
     
     return model, centers
+
+def load_latest_epoch(save_dir):
+    epoch_file = os.path.join(save_dir, "latest_epoch.txt")
+    if os.path.exists(epoch_file):
+        with open(epoch_file, "r") as f:
+            epoch = int(f.read().strip())
+        print(f"Resuming from epoch {epoch}")
+        return epoch
+    return 0
 
 def setup_optimizer_and_scheduler(model, args, total_steps=None):
     """
@@ -209,32 +217,8 @@ def evaluate_model(factornet, kernel_centers, num_test_sample):
     return average_total_loss
 
 def opt_check(factornet, samples, centers, optimizer, scheduler=None, scheduler_type='one_cycle', stab=1e-6):
-def opt_check(factornet, samples, centers, optimizer, scheduler=None, scheduler_type='one_cycle', stab=1e-6):
     optimizer.zero_grad(set_to_none=True)
     loss = LearnCholesky.score_implicit_matching_stable(factornet, samples, centers, stab)
-    
-    # Only print debug info occasionally or when there's an issue
-    if torch.isnan(loss) or torch.isinf(loss) or not loss.requires_grad:
-        print(f"⚠️ Loss issue detected: {loss}")
-        print(f"Loss requires_grad: {loss.requires_grad}")
-        print(f"Loss grad_fn: {loss.grad_fn}")
-    
-    if loss.requires_grad and loss.grad_fn is not None:
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(factornet.parameters(), max_norm=100.0)
-        optimizer.step()
-        # Update scheduler if provided
-        if scheduler is not None:
-            if scheduler_type == 'reduce_on_plateau':
-                # Don't step here - will be called with validation loss
-                pass
-            elif scheduler_type in ['cosine_annealing', 'one_cycle']:
-                scheduler.step()
-            else:
-                scheduler.step()
-    else:
-        print("❌ Gradient flow broken!")
-        
     
     # Only print debug info occasionally or when there's an issue
     if torch.isnan(loss) or torch.isinf(loss) or not loss.requires_grad:
@@ -288,34 +272,6 @@ def print_memory_usage(step):
           f"Reserved: {reserved:.2f}GB | "
           f"Max: {max_allocated:.2f}GB")
 
-def check_model_gradients(model):
-    total_params = 0
-    trainable_params = 0
-    
-    for name, param in model.named_parameters():
-        total_params += param.numel()
-        if param.requires_grad:
-            trainable_params += param.numel()
-        else:
-            print(f"Non-trainable parameter: {name}, shape: {param.shape}")
-    
-    print(f"Total parameters: {total_params}")
-    print(f"Trainable parameters: {trainable_params}")
-    return trainable_params > 0
-
-def print_memory_usage(step):
-    """Print detailed memory usage for all GPUs"""
-    num_gpus = torch.cuda.device_count()
-    print(f"Memory usage at step {step}:")
-    for device_id in range(num_gpus):
-        allocated = torch.cuda.memory_allocated(device_id) / 2**30  # GB
-        reserved = torch.cuda.memory_reserved(device_id) / 2**30   # GB
-        max_allocated = torch.cuda.max_memory_allocated(device_id) / 2**30  # GB
-        print(f"GPU {device_id} Step {step:04d} | "
-          f"Allocated: {allocated:.2f}GB | "
-          f"Reserved: {reserved:.2f}GB | "
-          f"Max: {max_allocated:.2f}GB")
-
 #----------------------- SAVE FUNCTIONS -------------------
 def create_save_dir(save):
     '''
@@ -330,7 +286,6 @@ def create_save_dir(save):
             #f"test_size{test_samples_size}",
             f"lr{lr}_hu{hidden_units}_stab{stab}_stabveropt"
             #f"test_size{test_samples_size}_lr{lr}_hu{hidden_units}_stab{stab}_comp"
-            #f"test_size{test_samples_size}_lr{lr}_hu{hidden_units}_stab{stab}_comp"
             #f"lr{lr}_hu{hidden_units}_stab{stab}"
         )
         os.makedirs(subfolder, exist_ok=True)
@@ -342,30 +297,26 @@ def create_save_dir(save):
             #f"test_size{test_samples_size}",
             f"lr{lr}_hu{hidden_units}_stab{stab}_stabveropt"
             #f"test_size{test_samples_size}_lr{lr}_hu{hidden_units}_stab{stab}_comp"
-            #f"test_size{test_samples_size}_lr{lr}_hu{hidden_units}_stab{stab}_comp"
             #f"lr{lr}_hu{hidden_units}_stab{stab}"
         )
         os.makedirs(subfolder, exist_ok=True)
     return subfolder
 
 def save_training_slice_cov(factornet, means, epoch, save):
-    '''
-    Save the training slice of the NN in parameter-based subfolders,
-    with epoch appended to the filename.
-    '''
     if save is not None:
-        # Create filename with epoch appended
         filename = os.path.join(save, f"epoch{epoch:04d}_factornet.pth")
-
-        # Save model weights
         state_dict = factornet.module.state_dict() if isinstance(factornet, nn.DataParallel) else factornet.state_dict()
         torch.save(state_dict, filename)
         logging.info(f"Saved model checkpoint to {filename}")
 
-        # Save centers if needed
-        # centers_filename = os.path.join(subfolder, f"epoch{epoch:04d}_centers.pth")
-        # torch.save(means, centers_filename)
-        # logging.info(f"Saved centers to {centers_filename}")
+        # Latest checkpoint (overwrite each time)
+        latest_model_ckpt = os.path.join(save, "latest_factornet.pth")
+        torch.save(state_dict, latest_model_ckpt)
+
+        # Save epoch number for resume
+        with open(os.path.join(save, "latest_epoch.txt"), "w") as f:
+            f.write(str(epoch))
+        logging.info(f"Saved latest epoch {epoch} for resuming.")
 
 def save_training_slice_log(iter_time, loss_time, epoch, max_mem, loss_value, save):
     '''
@@ -388,7 +339,6 @@ if torch.cuda.is_available():
     device = torch.device('cuda:0')
     print(f"Using {len(devices)} GPUs with DataParallel: {devices}")
 else:
-    devices = []
     devices = []
     device = torch.device('cpu')
 #device = torch.device('cpu')
@@ -417,10 +367,6 @@ parser.add_argument('--weight_decay', type=float, default = 1e-4)
 parser.add_argument('--scheduler_type', type=str, default='one_cycle',
                     choices=['reduce_on_plateau', 'cosine_annealing', 'one_cycle', 'step'],
                     help='Type of LR scheduler to use')
-parser.add_argument('--weight_decay', type=float, default = 1e-4)
-parser.add_argument('--scheduler_type', type=str, default='one_cycle',
-                    choices=['reduce_on_plateau', 'cosine_annealing', 'one_cycle', 'step'],
-                    help='Type of LR scheduler to use')
 args = parser.parse_args()
 
 # set parameters from args
@@ -439,14 +385,11 @@ load_centers_path = args.load_centers_path
 stab = args.stability
 weight_decay = args.weight_decay
 scheduler_type = args.scheduler_type
-weight_decay = args.weight_decay
-scheduler_type = args.scheduler_type
 
 #-------------------- Initialize Data -------------------
 # check the dataset
 if dataset not in ['swissroll', '8gaussians', 'pinwheel', 'circles', 'moons', '2spirals', 'checkerboard', 'rings','swissroll_6D_xy1', 'cifar10']:
     dataset = 'cifar10'
-means  = toy_data.inf_train_gen(dataset, batch_size = train_kernel_size).clone().detach().to(dtype=torch.float32, device=device) # type: ignore
 means  = toy_data.inf_train_gen(dataset, batch_size = train_kernel_size).clone().detach().to(dtype=torch.float32, device=device) # type: ignore
 data_dim = means.shape[1]
 del means
@@ -475,31 +418,60 @@ logging.info(f"-----------------------------------------------------------------
 #######################
 #------------------------ Initialize the model -------------------
 factornet = construct_factor_model(data_dim, depth, hidden_units).to(device).to(dtype = torch.float32)
-centers = toy_data.inf_train_gen(dataset, batch_size=train_kernel_size).clone().detach().to(dtype=torch.float32, device=device) # type: ignore
-centers = toy_data.inf_train_gen(dataset, batch_size=train_kernel_size).clone().detach().to(dtype=torch.float32, device=device) # type: ignore
+p_samples = toy_data.inf_train_gen(dataset,batch_size = train_samples_size)
+training_samples = p_samples.clone().detach().to(dtype=torch.float32, device=device) # type: ignore
+del p_samples
+#centers = toy_data.inf_train_gen(dataset, batch_size=train_kernel_size).clone().detach().to(dtype=torch.float32, device=device) # type: ignore
 #factornet = nn.DataParallel(factornet, device_ids=devices)
 #Load model and centers if specified
 #factornet = torch.compile(factornet, mode="reduce-overhead") # must be compiled before DataParallel
-#Load model and centers if specified
-#factornet = torch.compile(factornet, mode="reduce-overhead") # must be compiled before DataParallel
+
+latest_model_ckpt = os.path.join(save_directory, "latest_factornet.pth")
+latest_centers_ckpt = os.path.join(save_directory, "latest_centers.pth")
+
+if load_model_path is None and os.path.exists(latest_model_ckpt):
+    load_model_path = latest_model_ckpt
+
+if load_centers_path is None and os.path.exists(latest_centers_ckpt):
+    load_centers_path = latest_centers_ckpt
+
+start_epoch = 0
 if load_model_path or load_centers_path:
-    print("loading model")
-    save_directory = os.path.dirname(load_model_path) if load_model_path else save_directory
-    new_dir = os.path.join(save_directory, "loaded")
-    if not os.path.exists(new_dir):
-        os.makedirs(new_dir)
-    save_directory = new_dir  # ✅ Set after creation
-    factornet, centers = load_model(factornet, centers, load_model_path, load_centers_path)
-if devices:
-    factornet = nn.DataParallel(factornet, device_ids=devices) # Wrap model in DataParallel, must be done after loading the model
+    print(f"Loading checkpoint from {load_model_path}, {load_centers_path}")
+    # Load model and centers, centers can be None and replaced if needed below
+    factornet, centers = load_model(factornet, None, load_model_path, load_centers_path)
+    start_epoch = load_latest_epoch(save_directory)
+
+# If no centers loaded (e.g. fresh start), generate and save them
+if start_epoch == 0 or centers is None:
+    print("Generating new centers...")
+    centers = training_samples[:train_kernel_size]
+    
+    centers_path = os.path.join(save_directory, 'centers.pt')
+    torch.save(centers, centers_path)
+    
+    centers_img_path = os.path.join(save_directory, 'centers.png')
+    LearnCholesky.plot_and_save_centers(centers, centers_img_path)
+else:
+    print(f"Using loaded centers from checkpoint.")
+
+print(f"Starting training from epoch {start_epoch} / {epochs}")
+
 if devices:
     factornet = nn.DataParallel(factornet, device_ids=devices) # Wrap model in DataParallel, must be done after loading the model
 
 #------------------------ Initialize the optimizer -------------------
 lr = args.lr
 # Set total steps for OneCycleLR if needed
-steps_per_epoch = max(1, train_samples_size // batch_size)  # Use integer division and ensure at least 1
+steps_per_epoch = max(1, train_samples_size // batch_size)
 total_steps = epochs * steps_per_epoch
+start_step = start_epoch * steps_per_epoch
+remaining_steps = total_steps - start_step
+
+if remaining_steps <= 0:
+    print("Training already completed based on loaded checkpoint. Exiting.")
+    sys.exit(0)
+
 optimizer, scheduler = setup_optimizer_and_scheduler(factornet, args, total_steps)
 
 # Print scheduler info for debugging
@@ -521,26 +493,8 @@ scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
     cooldown=2,
     min_lr=1e-7,
     #verbose=True
-    #verbose=True
 )
 '''
-'''
-p_samples = toy_data.inf_train_gen(dataset,batch_size = train_samples_size)
-training_samples = p_samples.clone().detach().to(dtype=torch.float32, device=device) # type: ignore
-training_samples = p_samples.clone().detach().to(dtype=torch.float32, device=device) # type: ignore
-
-filename_final = os.path.join(save_directory, 'centers.pt')
-#generate centers as subset of training samples
-#centers = training_samples[torch.randperm(training_samples.size(0))[:train_kernel_size]]
-centers = training_samples[:train_kernel_size] # not random centers, with shuffle = false gives you same first kernels elements
-
-torch.save(centers, filename_final) #save the centers (we fix them in the beginning)
-filename_final = os.path.join(save_directory, 'centers.png')
-LearnCholesky.plot_and_save_centers(centers, filename_final)
-del p_samples
-# Call this before training
-if not check_model_gradients(factornet):
-    print("ERROR: No trainable parameters found!")
 # Call this before training
 if not check_model_gradients(factornet):
     print("ERROR: No trainable parameters found!")
@@ -552,13 +506,12 @@ torch.cuda.empty_cache()
 #scaler = torch.amp.GradScaler(enabled=False)  #mixed precision gradient scaler
 compiled_opt_check = opt_check # compile the optimization function
 
-for step in trange(total_steps, desc="Training"):
+for step in trange(start_step,total_steps, desc="Training"):
     torch.cuda.reset_peak_memory_stats() #reset peak memory stats for the current device
     randind = torch.randint(0, train_samples_size, [batch_size,])
     samples = training_samples[randind, :]
     iter_start = time.time()
     # with torch.autograd.detect_anomaly():
-    loss = compiled_opt_check(factornet, samples, centers, optimizer, scheduler=scheduler, scheduler_type=scheduler_type, stab=stab)
     loss = compiled_opt_check(factornet, samples, centers, optimizer, scheduler=scheduler, scheduler_type=scheduler_type, stab=stab)
     loss_value = loss.item()
     if torch.isnan(loss) or torch.isinf(loss):
@@ -569,12 +522,12 @@ for step in trange(total_steps, desc="Training"):
     max_mem = torch.cuda.max_memory_allocated() / 2**30  # in GiB
     #print(f"Peak memory usage: {max_mem} GiB")
     #print_memory_usage(step)
-    #print_memory_usage(step)
     '''
     for device_id in [0, 1]:  # assuming 2 GPUs: cuda:0 and cuda:1
         print(f"Memory summary for cuda:{device_id}")
         print(torch.cuda.memory_summary(device=f'cuda:{device_id}', abbreviated=False))
     '''
+
     if step % 100 == 0:
         print(f"Step {step} started")
         print(f'Step: {step}, Loss value: {loss_value:.3e}')
