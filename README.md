@@ -139,3 +139,6 @@ cifar10_experiments/
 None
 --load_centers_path
 None
+
+python train_wpo_sgm_stable.py --niters 50 --batch_size 64 --lr 0.0001 --stability 0.001 --train_kernel_size 200 --train_samples_size 50000 --test_samples_size 50 
+python3 train_wpo_sgm_stable.py --niters 50 --batch_size 4 --train_kernel_size 500 --train_samples_size 50000 --test_samples_size 5 --lr 0.0001 --stability 0.01 --hiddenunits 64 --scheduler_type 'step'
