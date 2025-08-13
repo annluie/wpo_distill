@@ -28,11 +28,12 @@ from WPO_SGM.utilities import *
 DEFAULT_EPSILON = 1e-4
 DEFAULT_MAX_COND = 1e12
 DEFAULT_MAX_ATTEMPTS = 3
-DEFAULT_CENTERS_CHUNK_SIZE = 250
+DEFAULT_CENTERS_CHUNK_SIZE = 100
 DEFAULT_BATCH_CHUNK_SIZE = 64
 DEFAULT_TEMPERATURE = 1.0
-DEFAULT_LOGPROB_CLAMP = 100
-DEFAULT_LOGITS_CLAMP = 100  # Reduced for stability
+DEFAULT_LOGPROB_CLAMP = 200
+DEFAULT_LOGITS_CLAMP = 50  # Reduced for stability
+DEFAULT_CLEAR_CACHE_FREQUENCY = 10  # Reduced frequency for aggressive cache clearing
 
 '''
 # ===================== #
@@ -318,7 +319,7 @@ def vectors_to_precision_chunked_optimized_new(vectors, dim, base_epsilon=DEFAUL
         results.append(result)
         # KEEP - Major chunk processing
         del chunk, result
-        if i % (chunk_size * 4) == 0:  # Less frequent cache clearing
+        if i % (chunk_size * DEFAULT_CLEAR_CACHE_FREQUENCY) == 0:  # Less frequent cache clearing
             torch.cuda.empty_cache()
     return torch.cat(results, dim=0)
 

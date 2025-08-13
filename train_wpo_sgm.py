@@ -34,7 +34,7 @@ import torch.distributed as dist
 from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingWarmRestarts, OneCycleLR
 #torch._dynamo.config.suppress_errors = True
 # ------------------- PROJECT MODULES -------------------
-from plots import *
+from utilities.plots import *
 from WPO_SGM import functions_WPO_SGM as LearnCholesky
 from WPO_SGM import toy_data
 #from WPO_SGM import function_cpu as LearnCholesky

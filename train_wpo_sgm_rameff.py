@@ -32,10 +32,10 @@ matplotlib.use('Agg')  # Use non-interactive backend
 import matplotlib.pyplot as plt
 
 # Project modules
-from plots import *
+from utilities.plots import *
 from WPO_SGM import functions_WPO_SGM_stable as LearnCholesky
 from WPO_SGM import toy_data
-import load
+import config.load as load
 
 ###################
 # DDP Setup Functions
@@ -63,43 +63,38 @@ class CheckpointedSequential(nn.Sequential):
     def forward(self, x):
         return cp.checkpoint_sequential(self, self.chunks, x)
 
-def construct_factor_model(dim: int, depth: int, hidden_units: int, use_checkpointing: bool = False):
+def construct_factor_model(dim: int, depth: int, hidden_units: int, dropout: float = 0.1, use_checkpointing: bool = False):
     """
-    Initializes neural network that models the Cholesky factor of the precision matrix.
-    
-    Args:
-        dim: Input dimension
-        depth: Number of hidden layers
-        hidden_units: Number of units per hidden layer
-        use_checkpointing: Whether to use gradient checkpointing
+    Initializes a neural network that models the Cholesky factor of the precision matrix.
+    Includes dropout for regularization to mitigate memorization.
     """
     layers = []
-    layers.append(nn.Linear(dim, hidden_units, bias=True))
+    layers.append(nn.Linear(dim, hidden_units))
     layers.append(nn.GELU())
+    layers.append(nn.Dropout(dropout))
 
     for _ in range(depth - 1):
-        layers.append(nn.Linear(hidden_units, hidden_units, bias=True))
+        layers.append(nn.Linear(hidden_units, hidden_units))
         layers.append(nn.GELU())
-    
-    # Final layer initialization for stability
+        layers.append(nn.Dropout(dropout))
+
     final_layer = nn.Linear(hidden_units, int(dim * (dim + 1) / 2), bias=True)
-    
+
+    # Initialize final layer to produce near-identity precision matrices
     with torch.no_grad():
-        final_layer.weight.data.fill_(0.0)
-        final_layer.bias.data.fill_(0.0)
-        
-        # Initialize diagonal elements
-        diagonal_indices = []
+        final_layer.weight.fill_(0.0)
+        final_layer.bias.fill_(0.0)
+        diag_indices = []
         k = 0
         for i in range(dim):
             for j in range(i + 1):
                 if i == j:
-                    diagonal_indices.append(k)
+                    diag_indices.append(k)
                 k += 1
-        final_layer.bias.data[diagonal_indices] = 0.1
+        final_layer.bias[diag_indices] = 0.1
 
     layers.append(final_layer)
-    
+
     if use_checkpointing:
         return CheckpointedSequential(*layers, chunks=2)
     else:
@@ -298,7 +293,7 @@ def create_save_dir(save, args):
             save,
             f"sample_size{args.train_samples_size}",
             f"centers{args.train_kernel_size}",
-            f"batch_size{args.batch_size}_epochs{args.niters}",
+            f"batch_size{args.batch_size}_epochs{args.niters}_dropout{args.dropout}",
             f"lr{args.lr}_scheduler{args.scheduler_type}_stab{args.stability}_stabver_ddp"
         )
     else:
@@ -360,7 +355,7 @@ def main_worker(rank, world_size, args):
     test_samples_size = args.test_samples_size
     dataset = args.data 
     epochs = args.niters
-    batch_size = args.batch_size
+    batch_size = args.batch_size // world_size
     lr = args.lr
     hidden_units = args.hiddenunits
     depth = args.depth
@@ -371,6 +366,7 @@ def main_worker(rank, world_size, args):
     weight_decay = args.weight_decay
     scheduler_type = args.scheduler_type
     accum_steps = 1
+    dropout = args.dropout  
     
     # Setup device optimizations
     torch.set_float32_matmul_precision('high')
@@ -390,6 +386,7 @@ def main_worker(rank, world_size, args):
             format='%(asctime)s - %(message)s',
             datefmt='%Y-%m-%d %H:%M:%S'
         )
+        logging.info(f"---------------------------------------------------------------------------------------------")
         logging.info("Training started")
     
     # Broadcast save directory to all processes
@@ -401,7 +398,7 @@ def main_worker(rank, world_size, args):
     data_sample = toy_data.inf_train_gen(dataset, batch_size=train_kernel_size)
     data_dim = data_sample.shape[1]
     
-    factornet = construct_factor_model(data_dim, depth, hidden_units).to(device, dtype=torch.float32)
+    factornet = construct_factor_model(data_dim, depth, hidden_units, dropout=dropout).to(device, dtype=torch.float32)
     
     # Generate training data
     p_samples = toy_data.inf_train_gen(dataset, batch_size=train_samples_size)
@@ -445,7 +442,7 @@ def main_worker(rank, world_size, args):
     
     # Setup DDP
     if world_size > 1:
-        factornet = DDP(factornet, device_ids=[rank], output_device=rank, find_unused_parameters=True)
+        factornet = DDP(factornet, device_ids=[rank], output_device=rank, find_unused_parameters=False)
     
     # Adjust scheduler for resumption
     if hasattr(scheduler, '_step_count'):
@@ -464,7 +461,7 @@ def main_worker(rank, world_size, args):
     gc.collect()
     torch.cuda.empty_cache()
     
-    pbar = trange(start_step, total_steps, desc="Training") if rank == 0 else range(epochs)
+    pbar = trange(start_step, total_steps, desc="Training") if rank == 0 else range(start_step, total_steps)
     
     for step in pbar:
         torch.cuda.reset_peak_memory_stats()
@@ -534,7 +531,7 @@ def main_worker(rank, world_size, args):
                 checkpoint_path = os.path.join(save_directory, "latest_checkpoint.pth")
                 save_checkpoint(checkpoint_path, factornet, optimizer, scheduler, step)
         
-        if step % 500 == 0 and rank == 0:
+        if step % 200 == 0 and rank == 0:
             with torch.no_grad():
                 filename = os.path.join(save_directory, f"step{step:05d}")
                 #plot_images_with_model(factornet, centers, plot_number=10, eps=stab, save_path=filename)
@@ -577,6 +574,7 @@ def main():
     parser.add_argument('--load_centers_path', type=str, default=None, help='Path to load centers')
     parser.add_argument('--stability', type=float, default=0.01, help='Stability parameter')
     parser.add_argument('--weight_decay', type=float, default=1e-4, help='Weight decay')
+    parser.add_argument('--dropout', type=float, default=0.1, help='Dropout rate')
     parser.add_argument('--scheduler_type', type=str, default='one_cycle',
                         choices=['reduce_on_plateau', 'cosine_annealing', 'one_cycle', 'step'],
                         help='Type of LR scheduler')

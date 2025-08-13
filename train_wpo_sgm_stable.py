@@ -41,12 +41,16 @@ import torch.utils.checkpoint as cp
 import torch.nn as nn
 #torch._dynamo.config.suppress_errors = True
 # ------------------- PROJECT MODULES -------------------
-from plots import *
+from utilities.plots import *
 from WPO_SGM import functions_WPO_SGM_stable as LearnCholesky
 from WPO_SGM import toy_data
 #from WPO_SGM import function_cpu as LearnCholesky
-import load as load
+import config.load as load
 
+from train_wpo_sgm_model_parallel import (
+    setup_chunked_training, 
+    setup_gradient_accumulation_training
+)
 
 ###################
 # functions
@@ -156,7 +160,6 @@ def setup_optimizer_and_scheduler(model, args, total_steps=None):
         amsgrad=False  # Can set to True for more stable training
     )
 
-
     # Choose scheduler based on training strategy
     scheduler_type = getattr(args, 'scheduler_type', 'reduce_on_plateau')
     
@@ -201,7 +204,7 @@ def setup_optimizer_and_scheduler(model, args, total_steps=None):
         # Fallback to simple step scheduler
         scheduler = optim.lr_scheduler.StepLR(
             optimizer,
-            step_size=2000,
+            step_size=100,
             gamma=0.5
         )
     
@@ -211,17 +214,21 @@ def setup_optimizer_and_scheduler(model, args, total_steps=None):
 #compiled_score = torch.compile(LearnCholesky.score_implicit_matching_optimized)
 #compiled_score = torch.compile(LearnCholesky.score_implicit_matching)
 
-
 def evaluate_model(factornet, kernel_centers, num_test_sample, num_batches=2):
     """
-    Evaluate the model by computing the average total loss over `num_batches` of test samples.
-    Optimized to reduce data transfer and improve efficiency.
+    Evaluate the model by computing the average total loss over test samples.
+    FIXED: Handle chunked trainer properly
     """
     device = kernel_centers.device
     total_loss_sum = 0.0
 
-
-    factornet.eval()  # Ensures no dropout, batchnorm updates
+    # FIXED: Handle both regular model and chunked trainer
+    if hasattr(factornet, 'factornet'):  # It's a chunked trainer
+        model = factornet.factornet
+    else:
+        model = factornet
+    
+    model.eval()
     with torch.no_grad():
         for _ in range(num_batches):
             # Generate test samples directly on the correct device
@@ -231,21 +238,21 @@ def evaluate_model(factornet, kernel_centers, num_test_sample, num_batches=2):
             else:
                 p_samples = p_samples.to(device=device, dtype=torch.float32, non_blocking=True)
 
-
-            # Evaluate loss
-            loss = LearnCholesky.score_implicit_matching_stable(
-                factornet, p_samples, kernel_centers, stab
-            )
+            # FIXED: Use appropriate evaluation method
+            if hasattr(factornet, 'compute_loss'):  # Chunked trainer
+                loss = factornet.compute_loss(p_samples, stab)
+            else:  # Regular model
+                loss = LearnCholesky.score_implicit_matching_stable(
+                    model, p_samples, kernel_centers, stab
+                )
+            
             total_loss_sum += loss.item()
 
-
     return total_loss_sum / num_batches
-
-
 def opt_check(factornet, samples, centers, optimizer, scheduler=None, scheduler_type='one_cycle', stab=1e-6):
     optimizer.zero_grad(set_to_none=True)
-    loss = LearnCholesky.score_implicit_matching_stable(factornet, samples, centers, stab)
-    
+    #loss = LearnCholesky.score_implicit_matching_stable(factornet, samples, centers, stab)
+    loss = chunked_trainer.compute_loss(samples, stab)
     # Only print debug info occasionally or when there's an issue
     if torch.isnan(loss) or torch.isinf(loss) or not loss.requires_grad:
         print(f"⚠️ Loss issue detected: {loss}")
@@ -450,7 +457,8 @@ scheduler_type = args.scheduler_type
 # check the dataset
 if dataset not in ['swissroll', '8gaussians', 'pinwheel', 'circles', 'moons', '2spirals', 'checkerboard', 'rings','swissroll_6D_xy1', 'cifar10']:
     dataset = 'cifar10'
-means  = toy_data.inf_train_gen(dataset, batch_size = train_kernel_size).clone().detach().to(dtype=torch.float32, device=device) # type: ignore
+means_data = toy_data.inf_train_gen(dataset, batch_size = train_kernel_size)
+means = torch.tensor(means_data, dtype=torch.float32, device=device) if not torch.is_tensor(means_data) else means_data.clone().detach().to(dtype=torch.float32, device=device)
 data_dim = means.shape[1]
 del means
 torch.cuda.empty_cache()
@@ -497,7 +505,7 @@ scheduler = None
 
 if load_model_path is not None and os.path.exists(load_model_path):
     factornet, optimizer, scheduler, start_step = load.load_checkpoint(
-        load_model_path, factornet, optimizer, scheduler, device=device
+        load_model_path, factornet, optimizer, scheduler, device=str(device)
     )
     print(f"✅ Loaded checkpoint from {load_model_path}")
 else:
@@ -511,7 +519,7 @@ if load_centers_path is None:
 else:
     centers_path = load_centers_path
 
-centers = load.load_centers(centers_path, device=device)
+centers = load.load_centers(centers_path, device=str(device))
 
 # If fresh training or failed to load, regenerate centers
 if start_step == 0 or centers is None:
@@ -572,23 +580,46 @@ torch.cuda.empty_cache()
 #scaler = torch.amp.GradScaler(enabled=False)  #mixed precision gradient scaler
 compiled_opt_check = opt_check # compile the optimization function
 
+# Replace your training loop with chunked approach
+chunked_trainer = setup_chunked_training(factornet, centers, chunk_size=500)
+
+# FIXED: Don't create a new optimizer - use the existing one with scheduler
+# The chunked_trainer.factornet should be the same as factornet
+if hasattr(chunked_trainer, 'factornet'):
+    # Update optimizer to point to chunked trainer's factornet parameters
+    for param_group in optimizer.param_groups:
+        param_group['params'] = list(chunked_trainer.factornet.parameters())
+
 for step in trange(start_step, total_steps, desc="Training"):
-    torch.cuda.reset_peak_memory_stats() #reset peak memory stats for the current device
+    torch.cuda.reset_peak_memory_stats()
     randind = torch.randint(0, train_samples_size, [batch_size,])
     samples = training_samples[randind, :]
     iter_start = time.time()
-    # with torch.autograd.detect_anomaly():
-    loss = compiled_opt_check(factornet, samples, centers, optimizer, scheduler=scheduler, scheduler_type=scheduler_type, stab=stab)
-    end_time = time.time()
-    iter_time = end_time - iter_start
-    #print(f"loss time: {iter_time:.4f} seconds")
-    #print_memory_usage(step)
+    
+    # FIXED: Use chunked trainer's compute_loss method
+    optimizer.zero_grad(set_to_none=True)
+    loss = chunked_trainer.compute_loss(samples, stab)
+    
+    if torch.isnan(loss) or torch.isinf(loss) or not loss.requires_grad:
+        print(f"⚠️ Loss issue detected: {loss}")
+        continue
+    
+    if loss.requires_grad and loss.grad_fn is not None:
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(chunked_trainer.factornet.parameters(), max_norm=100.0)
+        optimizer.step()
+        # Update scheduler if provided
+        if scheduler is not None:
+            if scheduler_type == 'reduce_on_plateau':
+                # Don't step here - will be called with validation loss
+                pass
+            elif scheduler_type in ['cosine_annealing', 'one_cycle']:
+                scheduler.step()
+            else:
+                scheduler.step()
     loss_value = loss.item()
-    if torch.isnan(loss) or torch.isinf(loss):
-        print(f"Invalid loss (NaN or Inf) at step {step}. Exiting.")
-        sys.exit(1)
-    #iter_end = time.time()
-    #iter_time = iter_end - iter_start
+    iter_end = time.time()
+    iter_time = iter_end - iter_start
     max_mem = torch.cuda.max_memory_allocated() / 2**30  # in GiB
     #print(f"Peak memory usage: {max_mem} GiB")
     #print_memory_usage(step)
@@ -611,7 +642,6 @@ for step in trange(start_step, total_steps, desc="Training"):
         loss_end = time.time()
         loss_time = loss_end - loss_start
         save_training_slice_log(iter_time, loss_time, step, max_mem, loss0, save_directory)
-
 
         # FIXED: Only call scheduler.step() for reduce_on_plateau here
         # OneCycleLR is already stepped in opt_check after each optimizer.step()

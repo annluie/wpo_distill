@@ -37,7 +37,7 @@ import torch.distributed as dist
 import torch._dynamo
 torch._dynamo.config.suppress_errors = True
 # ------------------- PROJECT MODULES -------------------
-from plots import *
+from utilities.plots import *
 #from WPO_SGM import functions_WPO_SGM as LearnCholesky
 from WPO_SGM import functions_WPO_SGM_stable as LearnCholesky
 from WPO_SGM import toy_data
