@@ -78,6 +78,30 @@ def visualize_nn_matches(generated, training, num_show=10, save_path=None):
         print(f"🔍 Saved NN visualization to {save_path}")
     plt.show()
 
+def plot_images_with_model_parallel(model_parallel, training_samples, plot_number=10, eps=1e-6, save_path=None):
+    """
+    Plot images using the model parallel setup with all centers
+    """
+    device = f'cuda:{model_parallel.device_ids[0]}'
+    
+    # Collect all centers from all devices to the first device
+    all_centers = []
+    for centers_on_device in model_parallel.centers_per_device:
+        if centers_on_device.numel() > 0:  # Skip empty center tensors
+            all_centers.append(centers_on_device.to(device))
+    
+    if not all_centers:
+        raise ValueError("No centers found across devices")
+    
+    # Concatenate all centers
+    combined_centers = torch.cat(all_centers, dim=0)
+    
+    # Use the first device's model for plotting (they should all be identical)
+    first_model = model_parallel.factornets[0]
+    
+    # Plot using all centers
+    plot_images_with_model_and_nn(first_model, combined_centers, training_samples, plot_number=plot_number, eps=eps, save_path=save_path)
+
 def plot_images_with_model_and_nn(factornet, means, training_data_tensor, plot_number=10, eps=1e-4, save_path=None):
     dim = means.shape[-1]
 
@@ -274,6 +298,54 @@ def plot_and_save_centers(centers, save_path, nrow=10, upscale_factor=8):
     plt.imshow(grid_upscaled.permute(1, 2, 0).cpu().numpy())
     plt.show()
 
+#----------------------- Model Parallel -------------------------------
+def sample_from_model_parallel(model_parallel, sample_number=10, eps=1e-6):
+    """
+    Sample from the model using all centers across all devices
+    """
+    device = f'cuda:{model_parallel.device_ids[0]}'
+    
+    # Collect all centers from all devices to the first device
+    all_centers = []
+    for centers_on_device in model_parallel.centers_per_device:
+        if centers_on_device.numel() > 0:  # Skip empty center tensors
+            all_centers.append(centers_on_device.to(device))
+    
+    if not all_centers:
+        raise ValueError("No centers found across devices")
+    
+    # Concatenate all centers
+    combined_centers = torch.cat(all_centers, dim=0)
+    
+    # Use the first device's model for sampling (they should all be identical)
+    first_model = model_parallel.factornets[0]
+    
+    # Sample using all centers
+    return sample_from_model(first_model, combined_centers, sample_number=sample_number, eps=eps)
+
+def plot_images_with_model_parallel(model_parallel, training_samples, plot_number=10, eps=1e-6, save_path=None):
+    """
+    Plot images using the model parallel setup with all centers
+    """
+    device = f'cuda:{model_parallel.device_ids[0]}'
+    
+    # Collect all centers from all devices to the first device
+    all_centers = []
+    for centers_on_device in model_parallel.centers_per_device:
+        if centers_on_device.numel() > 0:  # Skip empty center tensors
+            all_centers.append(centers_on_device.to(device))
+    
+    if not all_centers:
+        raise ValueError("No centers found across devices")
+    
+    # Concatenate all centers
+    combined_centers = torch.cat(all_centers, dim=0)
+    
+    # Use the first device's model for plotting (they should all be identical)
+    first_model = model_parallel.factornets[0]
+    
+    # Plot using all centers
+    plot_images_with_model_and_nn(first_model, combined_centers, training_samples, plot_number=plot_number, eps=eps, save_path=save_path)
 
 #---------OLD FUNCTIONS ----------------------------------
 

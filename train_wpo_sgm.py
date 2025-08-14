@@ -34,7 +34,7 @@ import torch.distributed as dist
 from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingWarmRestarts, OneCycleLR
 #torch._dynamo.config.suppress_errors = True
 # ------------------- PROJECT MODULES -------------------
-from plots import *
+from utilities.plots import *
 from WPO_SGM import functions_WPO_SGM as LearnCholesky
 from WPO_SGM import toy_data
 #from WPO_SGM import function_cpu as LearnCholesky
@@ -110,6 +110,15 @@ def load_model(model, centers, load_model_path, load_centers_path):
         print(f"No model loaded. Path does not exist: {load_model_path}")
     
     return model, centers
+
+def load_latest_epoch(save_dir):
+    epoch_file = os.path.join(save_dir, "latest_epoch.txt")
+    if os.path.exists(epoch_file):
+        with open(epoch_file, "r") as f:
+            epoch = int(f.read().strip())
+        print(f"Resuming from epoch {epoch}")
+        return epoch
+    return 0
 
 def setup_optimizer_and_scheduler(model, args, total_steps=None):
     """
@@ -294,23 +303,20 @@ def create_save_dir(save):
     return subfolder
 
 def save_training_slice_cov(factornet, means, epoch, save):
-    '''
-    Save the training slice of the NN in parameter-based subfolders,
-    with epoch appended to the filename.
-    '''
     if save is not None:
-        # Create filename with epoch appended
         filename = os.path.join(save, f"epoch{epoch:04d}_factornet.pth")
-
-        # Save model weights
         state_dict = factornet.module.state_dict() if isinstance(factornet, nn.DataParallel) else factornet.state_dict()
         torch.save(state_dict, filename)
         logging.info(f"Saved model checkpoint to {filename}")
 
-        # Save centers if needed
-        # centers_filename = os.path.join(subfolder, f"epoch{epoch:04d}_centers.pth")
-        # torch.save(means, centers_filename)
-        # logging.info(f"Saved centers to {centers_filename}")
+        # Latest checkpoint (overwrite each time)
+        latest_model_ckpt = os.path.join(save, "latest_factornet.pth")
+        torch.save(state_dict, latest_model_ckpt)
+
+        # Save epoch number for resume
+        with open(os.path.join(save, "latest_epoch.txt"), "w") as f:
+            f.write(str(epoch))
+        logging.info(f"Saved latest epoch {epoch} for resuming.")
 
 def save_training_slice_log(iter_time, loss_time, epoch, max_mem, loss_value, save):
     '''
@@ -412,26 +418,60 @@ logging.info(f"-----------------------------------------------------------------
 #######################
 #------------------------ Initialize the model -------------------
 factornet = construct_factor_model(data_dim, depth, hidden_units).to(device).to(dtype = torch.float32)
-centers = toy_data.inf_train_gen(dataset, batch_size=train_kernel_size).clone().detach().to(dtype=torch.float32, device=device) # type: ignore
+p_samples = toy_data.inf_train_gen(dataset,batch_size = train_samples_size)
+training_samples = p_samples.clone().detach().to(dtype=torch.float32, device=device) # type: ignore
+del p_samples
+#centers = toy_data.inf_train_gen(dataset, batch_size=train_kernel_size).clone().detach().to(dtype=torch.float32, device=device) # type: ignore
 #factornet = nn.DataParallel(factornet, device_ids=devices)
 #Load model and centers if specified
 #factornet = torch.compile(factornet, mode="reduce-overhead") # must be compiled before DataParallel
+
+latest_model_ckpt = os.path.join(save_directory, "latest_factornet.pth")
+latest_centers_ckpt = os.path.join(save_directory, "latest_centers.pth")
+
+if load_model_path is None and os.path.exists(latest_model_ckpt):
+    load_model_path = latest_model_ckpt
+
+if load_centers_path is None and os.path.exists(latest_centers_ckpt):
+    load_centers_path = latest_centers_ckpt
+
+start_epoch = 0
 if load_model_path or load_centers_path:
-    print("loading model")
-    save_directory = os.path.dirname(load_model_path) if load_model_path else save_directory
-    new_dir = os.path.join(save_directory, "loaded")
-    if not os.path.exists(new_dir):
-        os.makedirs(new_dir)
-    save_directory = new_dir  # ✅ Set after creation
-    factornet, centers = load_model(factornet, centers, load_model_path, load_centers_path)
+    print(f"Loading checkpoint from {load_model_path}, {load_centers_path}")
+    # Load model and centers, centers can be None and replaced if needed below
+    factornet, centers = load_model(factornet, None, load_model_path, load_centers_path)
+    start_epoch = load_latest_epoch(save_directory)
+
+# If no centers loaded (e.g. fresh start), generate and save them
+if start_epoch == 0 or centers is None:
+    print("Generating new centers...")
+    centers = training_samples[:train_kernel_size]
+    
+    centers_path = os.path.join(save_directory, 'centers.pt')
+    torch.save(centers, centers_path)
+    
+    centers_img_path = os.path.join(save_directory, 'centers.png')
+    LearnCholesky.plot_and_save_centers(centers, centers_img_path)
+else:
+    print(f"Using loaded centers from checkpoint.")
+
+print(f"Starting training from epoch {start_epoch} / {epochs}")
+
 if devices:
     factornet = nn.DataParallel(factornet, device_ids=devices) # Wrap model in DataParallel, must be done after loading the model
 
 #------------------------ Initialize the optimizer -------------------
 lr = args.lr
 # Set total steps for OneCycleLR if needed
-steps_per_epoch = max(1, train_samples_size // batch_size)  # Use integer division and ensure at least 1
+steps_per_epoch = max(1, train_samples_size // batch_size)
 total_steps = epochs * steps_per_epoch
+start_step = start_epoch * steps_per_epoch
+remaining_steps = total_steps - start_step
+
+if remaining_steps <= 0:
+    print("Training already completed based on loaded checkpoint. Exiting.")
+    sys.exit(0)
+
 optimizer, scheduler = setup_optimizer_and_scheduler(factornet, args, total_steps)
 
 # Print scheduler info for debugging
@@ -455,18 +495,6 @@ scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
     #verbose=True
 )
 '''
-p_samples = toy_data.inf_train_gen(dataset,batch_size = train_samples_size)
-training_samples = p_samples.clone().detach().to(dtype=torch.float32, device=device) # type: ignore
-
-filename_final = os.path.join(save_directory, 'centers.pt')
-#generate centers as subset of training samples
-#centers = training_samples[torch.randperm(training_samples.size(0))[:train_kernel_size]]
-centers = training_samples[:train_kernel_size] # not random centers, with shuffle = false gives you same first kernels elements
-
-torch.save(centers, filename_final) #save the centers (we fix them in the beginning)
-filename_final = os.path.join(save_directory, 'centers.png')
-LearnCholesky.plot_and_save_centers(centers, filename_final)
-del p_samples
 # Call this before training
 if not check_model_gradients(factornet):
     print("ERROR: No trainable parameters found!")
@@ -478,7 +506,7 @@ torch.cuda.empty_cache()
 #scaler = torch.amp.GradScaler(enabled=False)  #mixed precision gradient scaler
 compiled_opt_check = opt_check # compile the optimization function
 
-for step in trange(total_steps, desc="Training"):
+for step in trange(start_step,total_steps, desc="Training"):
     torch.cuda.reset_peak_memory_stats() #reset peak memory stats for the current device
     randind = torch.randint(0, train_samples_size, [batch_size,])
     samples = training_samples[randind, :]
@@ -499,6 +527,7 @@ for step in trange(total_steps, desc="Training"):
         print(f"Memory summary for cuda:{device_id}")
         print(torch.cuda.memory_summary(device=f'cuda:{device_id}', abbreviated=False))
     '''
+
     if step % 100 == 0:
         print(f"Step {step} started")
         print(f'Step: {step}, Loss value: {loss_value:.3e}')

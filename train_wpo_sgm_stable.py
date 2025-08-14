@@ -1,10 +1,12 @@
 ## Pretrain model (py version of Example_WPO_SGM.ipynb)
 
+
 ###################
 # setup
 ###################
 # ------------------- ENV & PATH SETUP -------------------
 import os
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True,max_split_size_mb:32'
 import sys
 import argparse
 # ------------------- TIME & LOGGING -------------------
@@ -14,12 +16,14 @@ import logging
 from tqdm import trange
 from memory_profiler import profile
 
+
 # ------------------- MATH -------------------
 import numpy as np
 import pandas as pd
 from pandas.plotting import scatter_matrix as pdsm
 import matplotlib.pyplot as plt
 import math
+
 
 # ------------------- PYTORCH -------------------
 import torch
@@ -29,21 +33,78 @@ import torch.multiprocessing as mp
 from torch.cuda.amp import GradScaler, autocast
 from torch.distributions.multivariate_normal import MultivariateNormal
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.checkpoint import checkpoint_sequential
 import torch.distributed as dist
 #import torch._dynamo
 from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingWarmRestarts, OneCycleLR
+import torch.utils.checkpoint as cp
+import torch.nn as nn
 #torch._dynamo.config.suppress_errors = True
 # ------------------- PROJECT MODULES -------------------
-from plots import *
+from utilities.plots import *
 from WPO_SGM import functions_WPO_SGM_stable as LearnCholesky
 from WPO_SGM import toy_data
 #from WPO_SGM import function_cpu as LearnCholesky
+import config.load as load
+
+from train_wpo_sgm_model_parallel import (
+    setup_chunked_training, 
+    setup_gradient_accumulation_training
+)
 
 ###################
 # functions
 ###################
 #----------------------- NEURAL NETWORK -------------------
 ## Cholesky factor model
+class CheckpointedSequential(nn.Sequential):
+    def __init__(self, *modules, chunks=2):
+        super().__init__(*modules)
+        self.chunks = chunks
+
+    def forward(self, x):
+        return cp.checkpoint_sequential(self, self.chunks, x)
+
+def construct_factor_model_checkpoint(dim: int, depth: int, hidden_units: int):
+    '''
+    Initializes neural network that models the Cholesky factor of the precision matrix.
+    Uses gradient checkpointing to reduce memory usage during training.
+    '''
+    chain = []
+    chain.append(nn.Linear(dim, hidden_units, bias=True)) 
+    chain.append(nn.GELU())
+
+
+    for _ in range(depth - 1):
+        chain.append(nn.Linear(hidden_units, hidden_units, bias=True))
+        chain.append(nn.GELU())
+    
+    # Final layer for stability
+    final_layer = nn.Linear(hidden_units, int(dim * (dim + 1) / 2), bias=True)
+    
+    with torch.no_grad():
+        final_layer.weight.data.fill_(0.0)
+        final_layer.bias.data.fill_(0.0)
+
+
+        diagonal_indices = []
+        k = 0
+        for i in range(dim):
+            for j in range(i + 1):
+                if i == j:
+                    diagonal_indices.append(k)
+                k += 1
+        final_layer.bias.data[diagonal_indices] = 0.1
+
+
+    chain.append(final_layer)
+
+
+    # Wrap with checkpointing sequential
+    model = CheckpointedSequential(*chain, chunks=2)
+    return model
+
+
 def construct_factor_model(dim:int, depth:int, hidden_units:int):
     '''
     Initializes neural network that models the Cholesky factor of the precision matrix # For nD examples (in theory)
@@ -51,6 +112,7 @@ def construct_factor_model(dim:int, depth:int, hidden_units:int):
     chain = []
     chain.append(nn.Linear(dim,int(hidden_units),bias =True)) 
     chain.append(nn.GELU())
+
 
     for _ in range(depth-1):
         chain.append(nn.Linear(int(hidden_units),int(hidden_units),bias = True))
@@ -77,39 +139,6 @@ def construct_factor_model(dim:int, depth:int, hidden_units:int):
     #chain.append(nn.Linear(int(hidden_units),int(dim*(dim+1)/2),bias = True)) 
     return nn.Sequential(*chain)
 
-def load_model(model, centers, load_model_path, load_centers_path):   
-    """
-    Loads model weights from the specified path.
-    """
-    if load_model_path is not None and os.path.exists(load_model_path):
-        state_dict = torch.load(load_model_path, map_location=device)
-        
-        # Strip "module." prefix if present
-        if any(k.startswith("module.") for k in state_dict.keys()):
-            from collections import OrderedDict
-            new_state_dict = OrderedDict()
-            for k, v in state_dict.items():
-                new_state_dict[k.replace("module.", "")] = v
-            state_dict = new_state_dict
-        
-        # Strip "_orig_mod." prefix if present
-        if any(k.startswith("_orig_mod.") for k in state_dict.keys()):
-            from collections import OrderedDict
-            new_state_dict = OrderedDict()
-            for k, v in state_dict.items():
-                new_state_dict[k.replace("_orig_mod.", "")] = v
-            state_dict = new_state_dict
-        
-        model.load_state_dict(state_dict)
-        logging.info(f"Loaded model weights from {load_model_path}")
-    
-    if load_centers_path is not None and os.path.exists(load_centers_path):
-        centers = torch.load(load_centers_path, map_location=device)
-        logging.info(f"Loaded centers from {load_centers_path}")
-    else:
-        print(f"No model loaded. Path does not exist: {load_model_path}")
-    
-    return model, centers
 
 def setup_optimizer_and_scheduler(model, args, total_steps=None):
     """
@@ -175,8 +204,8 @@ def setup_optimizer_and_scheduler(model, args, total_steps=None):
         # Fallback to simple step scheduler
         scheduler = optim.lr_scheduler.StepLR(
             optimizer,
-            step_size=30,
-            gamma=0.1
+            step_size=100,
+            gamma=0.5
         )
     
     return optimizer, scheduler
@@ -185,15 +214,21 @@ def setup_optimizer_and_scheduler(model, args, total_steps=None):
 #compiled_score = torch.compile(LearnCholesky.score_implicit_matching_optimized)
 #compiled_score = torch.compile(LearnCholesky.score_implicit_matching)
 
-def evaluate_model(factornet, kernel_centers, num_test_sample, num_batches=10):
+def evaluate_model(factornet, kernel_centers, num_test_sample, num_batches=2):
     """
-    Evaluate the model by computing the average total loss over `num_batches` of test samples.
-    Optimized to reduce data transfer and improve efficiency.
+    Evaluate the model by computing the average total loss over test samples.
+    FIXED: Handle chunked trainer properly
     """
     device = kernel_centers.device
     total_loss_sum = 0.0
 
-    factornet.eval()  # Ensures no dropout, batchnorm updates
+    # FIXED: Handle both regular model and chunked trainer
+    if hasattr(factornet, 'factornet'):  # It's a chunked trainer
+        model = factornet.factornet
+    else:
+        model = factornet
+    
+    model.eval()
     with torch.no_grad():
         for _ in range(num_batches):
             # Generate test samples directly on the correct device
@@ -203,18 +238,21 @@ def evaluate_model(factornet, kernel_centers, num_test_sample, num_batches=10):
             else:
                 p_samples = p_samples.to(device=device, dtype=torch.float32, non_blocking=True)
 
-            # Evaluate loss
-            loss = LearnCholesky.score_implicit_matching_stable(
-                factornet, p_samples, kernel_centers, stab
-            )
+            # FIXED: Use appropriate evaluation method
+            if hasattr(factornet, 'compute_loss'):  # Chunked trainer
+                loss = factornet.compute_loss(p_samples, stab)
+            else:  # Regular model
+                loss = LearnCholesky.score_implicit_matching_stable(
+                    model, p_samples, kernel_centers, stab
+                )
+            
             total_loss_sum += loss.item()
 
     return total_loss_sum / num_batches
-
 def opt_check(factornet, samples, centers, optimizer, scheduler=None, scheduler_type='one_cycle', stab=1e-6):
     optimizer.zero_grad(set_to_none=True)
-    loss = LearnCholesky.score_implicit_matching_stable(factornet, samples, centers, stab)
-    
+    #loss = LearnCholesky.score_implicit_matching_stable(factornet, samples, centers, stab)
+    loss = chunked_trainer.compute_loss(samples, stab)
     # Only print debug info occasionally or when there's an issue
     if torch.isnan(loss) or torch.isinf(loss) or not loss.requires_grad:
         print(f"⚠️ Loss issue detected: {loss}")
@@ -239,6 +277,7 @@ def opt_check(factornet, samples, centers, optimizer, scheduler=None, scheduler_
         
     return loss
 
+
 def check_model_gradients(model):
     total_params = 0
     trainable_params = 0
@@ -254,6 +293,7 @@ def check_model_gradients(model):
     print(f"Trainable parameters: {trainable_params}")
     return trainable_params > 0
 
+
 def print_memory_usage(step):
     """Print detailed memory usage for all GPUs"""
     num_gpus = torch.cuda.device_count()
@@ -267,6 +307,7 @@ def print_memory_usage(step):
           f"Reserved: {reserved:.2f}GB | "
           f"Max: {max_allocated:.2f}GB")
 
+
 #----------------------- SAVE FUNCTIONS -------------------
 def create_save_dir(save):
     '''
@@ -279,7 +320,7 @@ def create_save_dir(save):
             f"centers{train_kernel_size}",
             f"batch_size{batch_size}_epochs{epochs}",
             #f"test_size{test_samples_size}",
-            f"lr{lr}_hu{hidden_units}_stab{stab}_stabver"
+            f"lr{lr}_scheduler{scheduler_type}_stab{stab}_stabver"
             #f"test_size{test_samples_size}_lr{lr}_hu{hidden_units}_stab{stab}_comp"
             #f"lr{lr}_hu{hidden_units}_stab{stab}"
         )
@@ -290,31 +331,55 @@ def create_save_dir(save):
             f"centers{train_kernel_size}",
             f"batch_size{batch_size}_epochs{epochs}",
             #f"test_size{test_samples_size}",
-            f"lr{lr}_hu{hidden_units}_stab{stab}_stabver"
+            f"lr{lr}_scheduler{scheduler_type}_stab{stab}_stabver"
             #f"test_size{test_samples_size}_lr{lr}_hu{hidden_units}_stab{stab}_comp"
             #f"lr{lr}_hu{hidden_units}_stab{stab}"
         )
         os.makedirs(subfolder, exist_ok=True)
     return subfolder
 
-def save_training_slice_cov(factornet, means, epoch, save):
-    '''
-    Save the training slice of the NN in parameter-based subfolders,
-    with epoch appended to the filename.
-    '''
-    if save is not None:
-        # Create filename with epoch appended
-        filename = os.path.join(save, f"epoch{epoch:04d}_factornet.pth")
 
-        # Save model weights
+def save_training_slice_cov(factornet, step, save_dir, optimizer=None, scheduler=None):
+    """
+    Save model, optimizer, and scheduler state (centers saved separately only once)
+    """
+    if save_dir is not None:
+        # Save model
+        filename = os.path.join(save_dir, f"step{step:05d}_factornet.pth")
         state_dict = factornet.module.state_dict() if isinstance(factornet, nn.DataParallel) else factornet.state_dict()
         torch.save(state_dict, filename)
         logging.info(f"Saved model checkpoint to {filename}")
 
-        # Save centers if needed
-        # centers_filename = os.path.join(subfolder, f"epoch{epoch:04d}_centers.pth")
-        # torch.save(means, centers_filename)
-        # logging.info(f"Saved centers to {centers_filename}")
+
+        # Save latest model checkpoint
+        latest_model_ckpt = os.path.join(save_dir, "latest_factornet.pth")
+        torch.save(state_dict, latest_model_ckpt)
+
+
+        # Save optimizer and scheduler state
+        if optimizer is not None:
+            torch.save(optimizer.state_dict(), os.path.join(save_dir, "latest_optimizer.pth"))
+        if scheduler is not None:
+            torch.save(scheduler.state_dict(), os.path.join(save_dir, "latest_scheduler.pth"))
+
+
+        # Save step number
+        with open(os.path.join(save_dir, "latest_step.txt"), "w") as f:
+            f.write(str(step))
+        logging.info(f"Saved latest step {step} for resuming.")
+
+
+# Save checkpoints WITHOUT centers:
+def save_checkpoint(path, model, optimizer, scheduler, step):
+    checkpoint = {
+        'model_state_dict': model.state_dict() if not isinstance(model, nn.DataParallel) else model.module.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict() if optimizer else None,
+        'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+        'step': step,
+    }
+    torch.save(checkpoint, path)
+    logging.info(f"Saved checkpoint at step {step}")
+
 
 def save_training_slice_log(iter_time, loss_time, epoch, max_mem, loss_value, save):
     '''
@@ -341,10 +406,12 @@ else:
     device = torch.device('cpu')
 #device = torch.device('cpu')
 
+
 # ------------------- SET PARAMETERS -------------------
 torch.set_float32_matmul_precision('high') # set precision for efficient matrix multiplication
 # Setup optimal device settings once at startup
 LearnCholesky.setup_optimal_device_settings()
+
 
 # setup argument parser
 parser = argparse.ArgumentParser()
@@ -367,6 +434,7 @@ parser.add_argument('--scheduler_type', type=str, default='one_cycle',
                     help='Type of LR scheduler to use')
 args = parser.parse_args()
 
+
 # set parameters from args
 train_kernel_size = args.train_kernel_size
 train_samples_size = args.train_samples_size
@@ -384,14 +452,17 @@ stab = args.stability
 weight_decay = args.weight_decay
 scheduler_type = args.scheduler_type
 
+
 #-------------------- Initialize Data -------------------
 # check the dataset
 if dataset not in ['swissroll', '8gaussians', 'pinwheel', 'circles', 'moons', '2spirals', 'checkerboard', 'rings','swissroll_6D_xy1', 'cifar10']:
     dataset = 'cifar10'
-means  = toy_data.inf_train_gen(dataset, batch_size = train_kernel_size).clone().detach().to(dtype=torch.float32, device=device) # type: ignore
+means_data = toy_data.inf_train_gen(dataset, batch_size = train_kernel_size)
+means = torch.tensor(means_data, dtype=torch.float32, device=device) if not torch.is_tensor(means_data) else means_data.clone().detach().to(dtype=torch.float32, device=device)
 data_dim = means.shape[1]
 del means
 torch.cuda.empty_cache()
+
 
 #-------------------- Create Save Directory -------------------
 save_directory = create_save_dir(save_directory)
@@ -399,6 +470,7 @@ print('save_directory',save_directory)
 if not os.path.exists(save_directory):
     os.makedirs(save_directory)
     print('Created directory ' + save_directory)
+
 
 # Configure the logger
 log_filename = os.path.join(save_directory,'training.log'
@@ -411,69 +483,95 @@ logging.basicConfig(
 )
 logging.info(f"---------------------------------------------------------------------------------------------")
 
+
 #######################
 # Construct the model
 #######################
-#------------------------ Initialize the model -------------------
-factornet = construct_factor_model(data_dim, depth, hidden_units).to(device).to(dtype = torch.float32)
-centers = toy_data.inf_train_gen(dataset, batch_size=train_kernel_size).clone().detach().to(dtype=torch.float32, device=device) # type: ignore
-#factornet = nn.DataParallel(factornet, device_ids=devices)
-#Load model and centers if specified
-#factornet = torch.compile(factornet, mode="reduce-overhead") # must be compiled before DataParallel
-if load_model_path or load_centers_path:
-    print("loading model")
-    save_directory = os.path.dirname(load_model_path) if load_model_path else save_directory
-    new_dir = os.path.join(save_directory, "loaded")
-    if not os.path.exists(new_dir):
-        os.makedirs(new_dir)
-    save_directory = new_dir  # ✅ Set after creation
-    factornet, centers = load_model(factornet, centers, load_model_path, load_centers_path)
-if devices:
-    factornet = nn.DataParallel(factornet, device_ids=devices) # Wrap model in DataParallel, must be done after loading the model
+# ------------------------ Initialize the model ------------------------
+factornet = construct_factor_model(data_dim, depth, hidden_units).to(device).to(dtype=torch.float32)
+p_samples = toy_data.inf_train_gen(dataset, batch_size=train_samples_size)
+training_samples = p_samples.clone().detach().to(dtype=torch.float32, device=device)
+del p_samples
 
-#------------------------ Initialize the optimizer -------------------
-lr = args.lr
-# Set total steps for OneCycleLR if needed
-steps_per_epoch = max(1, train_samples_size // batch_size)  # Use integer division and ensure at least 1
+
+# ------------------------ Load model checkpoint ------------------------
+latest_checkpoint_path = os.path.join(save_directory, "latest_checkpoint.pth")
+if load_model_path is None and os.path.exists(latest_checkpoint_path):
+    load_model_path = latest_checkpoint_path
+
+start_step = 0
+optimizer = None
+scheduler = None
+
+if load_model_path is not None and os.path.exists(load_model_path):
+    factornet, optimizer, scheduler, start_step = load.load_checkpoint(
+        load_model_path, factornet, optimizer, scheduler, device=str(device)
+    )
+    print(f"✅ Loaded checkpoint from {load_model_path}")
+else:
+    print("🆕 No checkpoint found; starting fresh.")
+
+
+# ------------------------ Load or generate centers ------------------------
+# Determine centers path (argument or fallback)
+if load_centers_path is None:
+    centers_path = os.path.join(save_directory, "latest_centers.pth")
+else:
+    centers_path = load_centers_path
+
+centers = load.load_centers(centers_path, device=str(device))
+
+# If fresh training or failed to load, regenerate centers
+if start_step == 0 or centers is None:
+    print("Generating new centers...")
+    centers = training_samples[:train_kernel_size]
+    torch.save(centers, centers_path)
+    print(f"✅ Saved centers to {centers_path}")
+
+
+    centers_img_path = os.path.join(save_directory, "centers.png")
+    plot_and_save_centers(centers, centers_img_path)
+else:
+    print("✅ Using loaded centers from checkpoint.")
+
+
+# ------------------------ Wrap model for DataParallel ------------------------
+if len(devices)> 1:
+    factornet = nn.DataParallel(factornet, device_ids=devices)
+#else:
+    # compile the model for single GPU
+    #factornet = torch.compile(factornet, mode='reduce-overhead')
+# ------------------------ Setup optimizer & scheduler ------------------------
+steps_per_epoch = max(1, train_samples_size // batch_size)
 total_steps = epochs * steps_per_epoch
-optimizer, scheduler = setup_optimizer_and_scheduler(factornet, args, total_steps)
+remaining_steps = total_steps - start_step
 
-# Print scheduler info for debugging
+if remaining_steps <= 0:
+    print("✅ Training already completed based on checkpoint. Exiting.")
+    sys.exit(0)
+
+# Reinitialize optimizer/scheduler in case not loaded from checkpoint
+if optimizer is None or scheduler is None:
+    optimizer, scheduler = setup_optimizer_and_scheduler(factornet, args, total_steps)
+
+# Adjust scheduler state for resumption
+scheduler._step_count = start_step
+scheduler.last_epoch = start_step - 1
+
+# ------------------------ Debug Info ------------------------
 print(f"Scheduler type: {scheduler_type}")
 print(f"Steps per epoch: {steps_per_epoch}")
 print(f"Total steps: {total_steps}")
 print(f"Epochs: {epochs}")
 if scheduler_type == 'one_cycle':
-    print(f"OneCycleLR configured with max_lr={lr}, total_steps={total_steps}")
+    print(f"OneCycleLR configured with max_lr={args.lr}, total_steps={total_steps}")
 
-'''
-scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-    optimizer,
-    mode='min',
-    factor=0.5,
-    patience=5,
-    threshold=10.0,           # only triggers if loss doesn't improve by at least 10
-    threshold_mode='abs',
-    cooldown=2,
-    min_lr=1e-7,
-    #verbose=True
-)
-'''
-p_samples = toy_data.inf_train_gen(dataset,batch_size = train_samples_size)
-training_samples = p_samples.clone().detach().to(dtype=torch.float32, device=device) # type: ignore
 
-filename_final = os.path.join(save_directory, 'centers.pt')
-#generate centers as subset of training samples
-#centers = training_samples[torch.randperm(training_samples.size(0))[:train_kernel_size]]
-centers = training_samples[:train_kernel_size] # not random centers, with shuffle = false gives you same first kernels elements
-
-torch.save(centers, filename_final) #save the centers (we fix them in the beginning)
-filename_final = os.path.join(save_directory, 'centers.png')
-plot_and_save_centers(centers, filename_final)
-del p_samples
-# Call this before training
+# ------------------------ Gradient Check ------------------------
 if not check_model_gradients(factornet):
-    print("ERROR: No trainable parameters found!")
+    print("❌ ERROR: No trainable parameters found!")
+
+
 ###########################
 # Training loop
 ###########################
@@ -482,17 +580,44 @@ torch.cuda.empty_cache()
 #scaler = torch.amp.GradScaler(enabled=False)  #mixed precision gradient scaler
 compiled_opt_check = opt_check # compile the optimization function
 
-for step in trange(total_steps, desc="Training"):
-    torch.cuda.reset_peak_memory_stats() #reset peak memory stats for the current device
+# Replace your training loop with chunked approach
+chunked_trainer = setup_chunked_training(factornet, centers, chunk_size=500)
+
+# FIXED: Don't create a new optimizer - use the existing one with scheduler
+# The chunked_trainer.factornet should be the same as factornet
+if hasattr(chunked_trainer, 'factornet'):
+    # Update optimizer to point to chunked trainer's factornet parameters
+    for param_group in optimizer.param_groups:
+        param_group['params'] = list(chunked_trainer.factornet.parameters())
+
+for step in trange(start_step, total_steps, desc="Training"):
+    torch.cuda.reset_peak_memory_stats()
     randind = torch.randint(0, train_samples_size, [batch_size,])
     samples = training_samples[randind, :]
     iter_start = time.time()
-    # with torch.autograd.detect_anomaly():
-    loss = compiled_opt_check(factornet, samples, centers, optimizer, scheduler=scheduler, scheduler_type=scheduler_type, stab=stab)
+    
+    # FIXED: Use chunked trainer's compute_loss method
+    optimizer.zero_grad(set_to_none=True)
+    loss = chunked_trainer.compute_loss(samples, stab)
+    
+    if torch.isnan(loss) or torch.isinf(loss) or not loss.requires_grad:
+        print(f"⚠️ Loss issue detected: {loss}")
+        continue
+    
+    if loss.requires_grad and loss.grad_fn is not None:
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(chunked_trainer.factornet.parameters(), max_norm=100.0)
+        optimizer.step()
+        # Update scheduler if provided
+        if scheduler is not None:
+            if scheduler_type == 'reduce_on_plateau':
+                # Don't step here - will be called with validation loss
+                pass
+            elif scheduler_type in ['cosine_annealing', 'one_cycle']:
+                scheduler.step()
+            else:
+                scheduler.step()
     loss_value = loss.item()
-    if torch.isnan(loss) or torch.isinf(loss):
-        print(f"Invalid loss (NaN or Inf) at step {step}. Exiting.")
-        sys.exit(1)
     iter_end = time.time()
     iter_time = iter_end - iter_start
     max_mem = torch.cuda.max_memory_allocated() / 2**30  # in GiB
@@ -511,7 +636,7 @@ for step in trange(total_steps, desc="Training"):
         print(f'Current LR: {current_lr:.2e}')
         with open(os.path.join(save_directory, "loss_log.csv"), "a") as f:
             f.write(f"{step},{loss_value},{current_lr}\n")
-    if step % 200 == 0:
+    if step % 100 == 0:
         loss_start = time.time()
         loss0 = evaluate_model(factornet, centers, test_samples_size)
         loss_end = time.time()
@@ -538,21 +663,27 @@ for step in trange(total_steps, desc="Training"):
             print("⚠️ Warning: Skipping LR scheduler step due to invalid val_loss:", loss0)
         # Sample and save generated images at intermediate steps
         with torch.no_grad():
-            generated = sample_from_model(factornet, training_samples, sample_number=10, eps=stab)
+            generated = sample_from_model(factornet, centers, sample_number=10, eps=stab)
             l2 = torch.mean((generated - training_samples[:10])**2).item()
             print(f"[Step {step}] L2 to training data: {l2:.2f}")
             logging.info(f"L2 {l2:.2f} | ")
-    if step % 500 ==0:
+    if step % 200 ==0:
         with torch.no_grad():
             filename_step_sample = os.path.join(save_directory, f"step{step:05d}")
-            plot_images_with_model(factornet, centers, plot_number=10, eps=stab, save_path=filename_step_sample)
+            #plot_images_with_model(factornet, centers, plot_number=10, eps=stab, save_path=filename_step_sample)
+            plot_images_with_model_and_nn(factornet, centers, training_samples, plot_number=10, eps=stab, save_path=filename_step_sample)
             logging.info(f"Saved samples at step {step} to {filename_step_sample}")
-    if step % 1000 == 0:
-        save_training_slice_cov(factornet, centers, step, save_directory)
+        checkpoint_path = os.path.join(save_directory, "latest_checkpoint.pth")
+        save_checkpoint(checkpoint_path, factornet, optimizer, scheduler, step)
+        print(f"✅ Saved checkpoint at step {step} to {checkpoint_path}")
+    if step % 500 == 0:
+        save_training_slice_cov(factornet, step, save_directory, optimizer, scheduler)
+        
     if step < total_steps - 1:  # FIXED: Use total_steps instead of epochs
         del samples
         gc.collect()
         torch.cuda.empty_cache()
+
 
 ###############################
 # Evaluate the final model
@@ -561,10 +692,12 @@ for step in trange(total_steps, desc="Training"):
 gc.collect()
 torch.cuda.empty_cache()
 
+
 loss0 = evaluate_model(factornet, centers, test_samples_size)    
-save_training_slice_cov(factornet, centers, step, save_directory)
+save_training_slice_cov(factornet, step, save_directory, optimizer, scheduler)
 formatted_loss = f'{loss0:.3e}'  # Format the average with up to 1e-3 precision
 logging.info(f'After train, Average total_loss: {formatted_loss}')
+
 
 #---------------------------- Sample and save -------------------
 with torch.no_grad():
