@@ -145,4 +145,4 @@ conda create -n wpo_env python=3.11
 cd wpo_distill
 conda activate wpo_env
 pip install -r requirements.txt 
-python3 train_wpo_sgm_stable_parallel.py --niters 50 --batch_size 32 --train_kernel_size 1000 --train_samples_size 50000 --test_samples_size 5 --lr 0.0001 --stability 0.001 --hiddenunits 64 --scheduler_type 'step'
+python3 train_wpo_sgm_stable_parallel.py --niters 50 --batch_size 16 --train_kernel_size 1800 --train_samples_size 50000 --test_samples_size 5 --lr 0.0001 --stability 0.001 --hiddenunits 64 --scheduler_type 'step'

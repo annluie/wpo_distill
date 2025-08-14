@@ -35,23 +35,14 @@ DEFAULT_LOGPROB_CLAMP = 200
 DEFAULT_LOGITS_CLAMP = 50  # Reduced for stability
 DEFAULT_CLEAR_CACHE_FREQUENCY = 10  # Reduced frequency for aggressive cache clearing
 
-'''
 # ===================== #
-# Global Variables Config - Reduced for memory efficiency
+# Precompute and Cache reused values
 # ===================== #
-DEFAULT_EPSILON = 1e-4
-DEFAULT_MAX_COND = 1e12
-DEFAULT_MAX_ATTEMPTS = 3
-DEFAULT_CENTERS_CHUNK_SIZE = 10  # Reduced from 50
-DEFAULT_BATCH_CHUNK_SIZE = 1    # Reduced from 32
-DEFAULT_TEMPERATURE = 1.0
-DEFAULT_CLAMP = 100
-'''
+
+
 # ===================== #
 # JIT-Compiled Core Functions
 # ===================== #
-
-
 @script
 def _fast_condition_estimate_jit(matrices):
     """
@@ -75,7 +66,6 @@ def _fast_condition_estimate_jit(matrices):
     # Take the maximum of both estimates for safety
     return torch.max(diag_ratio, frob_ratio)
 
-
 @script
 def stable_softmax_jit(logits, temperature: float = 1.0)-> torch.Tensor:
     """JIT-compiled stable softmax"""
@@ -88,11 +78,9 @@ def stable_softmax_jit(logits, temperature: float = 1.0)-> torch.Tensor:
     
     return F.softmax(logits_clamped, dim=-1)
 
-
 #----------------------------------------------#
 #### Precision Matrix Functions ####
 #----------------------------------------------#
-
 def vectors_to_precision_stable(vectors, dim, base_epsilon=DEFAULT_EPSILON, max_cond=DEFAULT_MAX_COND):
     """
     Enhanced and corrected version of vectors_to_precision with improved numerical stability
@@ -100,32 +88,26 @@ def vectors_to_precision_stable(vectors, dim, base_epsilon=DEFAULT_EPSILON, max_
     if torch.isnan(vectors).any():
         print("❌ NaNs in vectors before conversion to precision!")
 
-
     batch_size = vectors.shape[0]
     device = vectors.device
     dtype = vectors.dtype
-
 
     # Construct lower triangular matrix
     L = torch.zeros(batch_size, dim, dim, dtype=dtype, device=device)
     indices = torch.tril_indices(dim, dim, device=device)
     L[:, indices[0], indices[1]] = vectors  # fixed from squeeze(1)
 
-
     # Ensure positive diagonal via softplus
     diag_indices = torch.arange(dim, device=device)
     L[:, diag_indices, diag_indices] = F.softplus(L[:, diag_indices, diag_indices]) * 0.1 + 1e-6
 
-
     # Construct precision matrix
     C = torch.matmul(L, L.transpose(1, 2))
-
 
     # Adaptive regularization
     adaptive_eps = adaptive_regularization(C, base_epsilon, max_cond)
     identity = torch.eye(dim, device=device, dtype=dtype)
     precision = C + adaptive_eps * identity
-
 
     for attempt in range(3):
         try:
@@ -135,9 +117,7 @@ def vectors_to_precision_stable(vectors, dim, base_epsilon=DEFAULT_EPSILON, max_
             reg_strength = base_epsilon * (10 ** (attempt + 1))
             precision = precision + reg_strength * identity
 
-
     return precision
-
 
 def vectors_to_precision_chunked_stable(vectors, dim, base_epsilon=DEFAULT_EPSILON, chunk_size=DEFAULT_CENTERS_CHUNK_SIZE):
     """
@@ -155,7 +135,6 @@ def vectors_to_precision_chunked_stable(vectors, dim, base_epsilon=DEFAULT_EPSIL
     
     return torch.cat(results, dim=0)
 
-
 def vectors_to_precision_optimized(vectors, dim, base_epsilon=DEFAULT_EPSILON):
     """
     Highly optimized version with minimal redundant operations
@@ -166,7 +145,6 @@ def vectors_to_precision_optimized(vectors, dim, base_epsilon=DEFAULT_EPSILON):
     batch_size = vectors.shape[0]
     device = vectors.device
     dtype = vectors.dtype
-
 
     if not hasattr(vectors_to_precision_optimized, 'tril_indices'): #only compute indices once to save memory
         vectors_to_precision_optimized.tril_indices = torch.tril_indices(dim, dim, device=device)
@@ -193,7 +171,6 @@ def vectors_to_precision_optimized(vectors, dim, base_epsilon=DEFAULT_EPSILON):
     # Most matrices will be positive definite after proper regularization
     return precision
 
-
 def vectors_to_precision_chunked_optimized(vectors, dim, base_epsilon=DEFAULT_EPSILON, chunk_size=DEFAULT_CENTERS_CHUNK_SIZE):
     results = []
     for i in range(0, vectors.size(0), chunk_size):
@@ -205,7 +182,6 @@ def vectors_to_precision_chunked_optimized(vectors, dim, base_epsilon=DEFAULT_EP
         if i % (chunk_size * 4) == 0:  # Less frequent cache clearing
             torch.cuda.empty_cache()
     return torch.cat(results, dim=0)
-
 
 def vectors_to_precision_memory_efficient(vectors, dim, base_epsilon=DEFAULT_EPSILON):
     """
@@ -240,7 +216,6 @@ def vectors_to_precision_memory_efficient(vectors, dim, base_epsilon=DEFAULT_EPS
     
     return C
 
-
 def vectors_to_precision_micro_chunked(vectors, dim, base_epsilon=DEFAULT_EPSILON, chunk_size=10):
     """
     Micro-chunked version for extreme memory constraints
@@ -268,7 +243,6 @@ def vectors_to_precision_micro_chunked(vectors, dim, base_epsilon=DEFAULT_EPSILO
     
     return cpu_result.to(vectors.device)
 
-
 def vectors_to_precision_optimized_new(vectors, dim, base_epsilon=DEFAULT_EPSILON):
     """
     Highly optimized version with minimal redundant operations
@@ -280,7 +254,6 @@ def vectors_to_precision_optimized_new(vectors, dim, base_epsilon=DEFAULT_EPSILO
     batch_size = vectors.shape[0]
     device = vectors.device
     dtype = vectors.dtype
-
 
     # Pre-allocate all tensors at once
     L = torch.empty(batch_size, dim, dim, dtype=dtype, device=device)
@@ -327,7 +300,6 @@ def vectors_to_precision_chunked_optimized_new(vectors, dim, base_epsilon=DEFAUL
 #### Computation Functions ####
 #----------------------------------------------#
 
-
 def adaptive_regularization(matrices, base_epsilon=DEFAULT_EPSILON, max_cond=DEFAULT_MAX_COND):
     """
     Compute adaptive regularization based on condition numbers
@@ -343,7 +315,6 @@ def adaptive_regularization(matrices, base_epsilon=DEFAULT_EPSILON, max_cond=DEF
         # Fallback to base epsilon if condition number computation fails
         batch_size = matrices.shape[0]
         return torch.full((batch_size, 1, 1), base_epsilon, device=matrices.device, dtype=matrices.dtype)
-
 
 def adaptive_regularization_fast(matrices, base_epsilon=DEFAULT_EPSILON, max_cond=DEFAULT_MAX_COND):
     """
@@ -365,7 +336,6 @@ def adaptive_regularization_fast(matrices, base_epsilon=DEFAULT_EPSILON, max_con
     except:
         return torch.full((batch_size, 1, 1), base_epsilon, device=device, dtype=dtype)
 
-
 def adaptive_regularization_fast_new(matrices, base_epsilon=DEFAULT_EPSILON, max_cond=DEFAULT_MAX_COND):
     """
     Faster adaptive regularization using JIT-compiled condition estimates
@@ -385,7 +355,6 @@ def adaptive_regularization_fast_new(matrices, base_epsilon=DEFAULT_EPSILON, max
     
     except Exception:
         return torch.full((batch_size, 1, 1), base_epsilon, device=device, dtype=dtype)
-
 
 def stable_logdet(matrices, eps=1e-6, max_attempts=DEFAULT_MAX_ATTEMPTS):
     """
@@ -418,7 +387,6 @@ def stable_logdet(matrices, eps=1e-6, max_attempts=DEFAULT_MAX_ATTEMPTS):
     except:
         # Ultimate fallback: return safe default values
         return torch.full((batch_size,), -10.0, device=device, dtype=dtype)
-
 
 def stable_logdet_memory_efficient(matrices, eps=1e-6):
     """
@@ -461,7 +429,6 @@ def stable_logdet_memory_efficient(matrices, eps=1e-6):
     del results
     return cpu_result.to(device)
 
-
 def stable_softmax(logits, temperature=1.0, dim=-1, eps=1e-8):
     """
     Numerically stable softmax with temperature scaling
@@ -478,7 +445,6 @@ def stable_softmax(logits, temperature=1.0, dim=-1, eps=1e-8):
     
     return F.softmax(logits_clamped, dim=dim)
 
-
 def stable_softmax_optimized(logits, temperature=1.0, dim=-1):
     """
     Optimized stable softmax with fewer operations
@@ -491,7 +457,6 @@ def stable_softmax_optimized(logits, temperature=1.0, dim=-1):
     logits_stable = torch.clamp(logits - logits_max, min=-DEFAULT_LOGITS_CLAMP, max=DEFAULT_LOGITS_CLAMP)
     
     return F.softmax(logits_stable, dim=dim)
-
 
 def stable_softmax_inplace(logits, temperature=1.0, dim=-1):
     """
@@ -507,12 +472,9 @@ def stable_softmax_inplace(logits, temperature=1.0, dim=-1):
     
     return F.softmax(logits, dim=dim)
 
-
 #----------------------------------------------#
 #### Loss Functions ####
 #----------------------------------------------#
-
-
 def grad_and_laplacian_mog_density_stable(x, means, precisions, temperature=1.0):
     """
     Optimized numerically stable version of gradient and Laplacian computation
@@ -566,7 +528,6 @@ def grad_and_laplacian_mog_density_stable(x, means, precisions, temperature=1.0)
     
     return gradient, laplacian_over_density
 
-
 def grad_and_laplacian_mog_density_chunked_stable(x, means, precisions, 
                                                   batch_chunk_size=DEFAULT_BATCH_CHUNK_SIZE, 
                                                   component_chunk_size=DEFAULT_CENTERS_CHUNK_SIZE,
@@ -599,7 +560,6 @@ def grad_and_laplacian_mog_density_chunked_stable(x, means, precisions,
         laplacians[start:end] = laplacian_chunk.detach() if not laplacian_chunk.requires_grad else laplacian_chunk
     
     return gradients, laplacians
-
 
 def grad_and_laplacian_mog_density_ultra_chunked(x, means, precisions, 
                                                  batch_chunk_size=8, 
@@ -644,7 +604,6 @@ def grad_and_laplacian_mog_density_ultra_chunked(x, means, precisions,
     del gradients_cpu, laplacians_cpu
     
     return gradients, laplacians
-
 
 def grad_and_laplacian_mog_density_component_chunked_stable(x, means, precisions, 
                                                            chunk_size=DEFAULT_CENTERS_CHUNK_SIZE, 
@@ -713,7 +672,6 @@ def grad_and_laplacian_mog_density_component_chunked_stable(x, means, precisions
     laplacian_over_density = torch.sum(laplacian_component, dim=1)
     
     return gradient, laplacian_over_density
-
 
 def grad_and_laplacian_mog_density_component_chunked_checkpointed(x, means, precisions, 
                                                                  chunk_size=DEFAULT_CENTERS_CHUNK_SIZE, 
@@ -806,7 +764,6 @@ def grad_and_laplacian_mog_density_component_chunked_checkpointed(x, means, prec
     laplacian_over_density = torch.sum(laplacian_component, dim=1)
     
     return gradient, laplacian_over_density
-
 
 def grad_and_laplacian_mog_density_component_chunked_ultra_checkpointed(x, means, precisions, 
                                                                        chunk_size=DEFAULT_CENTERS_CHUNK_SIZE, 
@@ -910,7 +867,6 @@ def grad_and_laplacian_mog_density_component_chunked_ultra_checkpointed(x, means
     
     return gradient, laplacian_over_density
 
-
 def grad_and_laplacian_mog_density_chunked_checkpointed(x, means, precisions, 
                                                        batch_chunk_size=DEFAULT_BATCH_CHUNK_SIZE, 
                                                        component_chunk_size=DEFAULT_CENTERS_CHUNK_SIZE,
@@ -944,7 +900,6 @@ def grad_and_laplacian_mog_density_chunked_checkpointed(x, means, precisions,
     
     return gradients, laplacians
 
-
 def grad_and_laplacian_mog_density_chunked_ultra_checkpointed(x, means, precisions, 
                                                        batch_chunk_size=DEFAULT_BATCH_CHUNK_SIZE, 
                                                        component_chunk_size=DEFAULT_CENTERS_CHUNK_SIZE,
@@ -977,7 +932,6 @@ def grad_and_laplacian_mog_density_chunked_ultra_checkpointed(x, means, precisio
         laplacians[start:end] = laplacian_chunk.detach() if not laplacian_chunk.requires_grad else laplacian_chunk
     
     return gradients, laplacians
-
 
 # Alternative: Ultra-fast version for when you can afford more memory
 def grad_and_laplacian_mog_density_vectorized(x, means, precisions, temperature=1.0):
@@ -1016,7 +970,6 @@ def grad_and_laplacian_mog_density_vectorized(x, means, precisions, temperature=
     laplacian_over_density = torch.sum(laplacian_component, dim=1)
     
     return gradient, laplacian_over_density
-
 
 def grad_and_laplacian_ultra_component_chunked(x, means, precisions, chunk_size=10, temperature=1.0):
     """
@@ -1100,7 +1053,6 @@ def grad_and_laplacian_ultra_component_chunked(x, means, precisions, chunk_size=
     laplacian_over_density = torch.sum(laplacian_component, dim=1)
     
     return gradient, laplacian_over_density
-
 
 def score_implicit_matching_stable(factornet, samples, centers, base_epsilon=DEFAULT_EPSILON, 
                                   temperature=DEFAULT_TEMPERATURE, max_attempts=DEFAULT_MAX_ATTEMPTS):
@@ -1215,7 +1167,6 @@ def score_implicit_matching_stable(factornet, samples, centers, base_epsilon=DEF
     
     # This should never be reached, but just in case
     raise RuntimeError("All attempts failed and no valid result was returned")
-
 
 def score_implicit_matching_stable_ddp(factornet, samples, centers, base_epsilon=DEFAULT_EPSILON, 
                                   temperature=DEFAULT_TEMPERATURE, max_attempts=DEFAULT_MAX_ATTEMPTS):
@@ -1364,7 +1315,6 @@ def score_implicit_matching_stable_ddp(factornet, samples, centers, base_epsilon
     # This should never be reached, but just in case
     raise RuntimeError("All attempts failed and no valid result was returned")
 
-
 def score_implicit_matching_memory_efficient(factornet, samples, centers, 
                                                   base_epsilon=DEFAULT_EPSILON, 
                                                   temperature=DEFAULT_TEMPERATURE, 
@@ -1436,7 +1386,6 @@ def score_implicit_matching_memory_efficient(factornet, samples, centers,
             
             if attempt == max_attempts - 1:
                 raise e
-
 
 def score_implicit_matching_ultra_memory_efficient(factornet, samples, centers,
                                                   base_epsilon=DEFAULT_EPSILON,
@@ -1536,7 +1485,6 @@ def score_implicit_matching_ultra_memory_efficient(factornet, samples, centers,
 
 
     raise RuntimeError("❌ All attempts failed due to memory.")
-
 
 def score_implicit_matching_stable_dp(factornet, samples, centers,
                                    base_epsilon=DEFAULT_EPSILON,

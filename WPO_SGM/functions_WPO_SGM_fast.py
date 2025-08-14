@@ -1,63 +1,86 @@
-# ===================== #
-# Speed-Optimized Functions (Memory-Efficient)
-# ===================== #
-import math
-import torch
-import torch.nn.functional as F
-from torch.jit import script
-import time
-###################
-# setup
-###################
-# ------------------- UTILITIES -------------------
-import time
-import gc
-from memory_profiler import profile
-from contextlib import contextmanager
-# ------------------- MATH -------------------
-import numpy as np
+#stable version of code
 import matplotlib.pyplot as plt
-# ------------------- PYTORCH -------------------
+import os
 import torch
+import torch.optim as optim
+import torch.nn as nn
+from torch.distributions.multivariate_normal import MultivariateNormal
 import torch.distributed as dist
-from torch.amp.autocast_mode import autocast
+#import lib.toy_data as toy_data
+import numpy as np
+import argparse
+from memory_profiler import profile
+from torch.amp import autocast
 from torch.utils.checkpoint import checkpoint
 import torch.nn.functional as F
 import torch.linalg as LA
-# ------------------- PROJECT MODULES -------------------
+import torchvision.utils as vutils
+from torch.jit import script
+import time
+import gc
+from contextlib import contextmanager
 from WPO_SGM.utilities import *
-
-# Global config remains the same
+from torch import compile
+# ===================== #
+# Global Variables Config
+# ===================== #
 DEFAULT_EPSILON = 1e-4
 DEFAULT_MAX_COND = 1e12
 DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_CENTERS_CHUNK_SIZE = 100
 DEFAULT_BATCH_CHUNK_SIZE = 64
 DEFAULT_TEMPERATURE = 1.0
-DEFAULT_LOGPROB_CLAMP = 100
-DEFAULT_LOGITS_CLAMP = 50
-LOG_2PI = math.log(2 * math.pi)
+DEFAULT_LOGPROB_CLAMP = 200
+DEFAULT_LOGITS_CLAMP = 50  # Reduced for stability
+DEFAULT_CLEAR_CACHE_FREQUENCY = 10  # Reduced frequency for aggressive cache clearing
 
+# ===================== #
+# Precompute and Cache reused values
+# ===================== #
+PRECISION_EYE = None  # Will be initialized in score function
+TRIL_INDICES = None  # Will be initialized in score function
 
 # ===================== #
 # JIT-Compiled Core Functions
 # ===================== #
-
 @script
 def _fast_condition_estimate_jit(matrices):
-    """JIT-compiled fast condition number estimation"""
+    """
+    More robust condition number estimation
+    """
     batch_size = matrices.shape[0]
     
-    # Fast condition estimate using diagonal vs Frobenius norm
-    diag_elements = torch.diagonal(matrices, dim1=-2, dim2=-1)
-    diag_norm = torch.norm(diag_elements, dim=-1)
-    frob_norm = torch.norm(matrices.view(batch_size, -1), dim=-1)
+    # Multiple condition estimates for robustness
+    diag_vals = torch.diagonal(matrices, dim1=-2, dim2=-1)
+    min_diag = torch.min(diag_vals, dim=-1)[0]
+    max_diag = torch.max(diag_vals, dim=-1)[0]
     
-    return frob_norm / (diag_norm + 1e-8)
+    # Estimate 1: Diagonal ratio
+    diag_ratio = torch.clamp(max_diag / (min_diag + 1e-8), 1.0, 1e12)
+    
+    # Estimate 2: Frobenius norm ratio
+    frob_norm = torch.norm(matrices.view(batch_size, -1), dim=-1)
+    trace = torch.trace(matrices.view(-1, matrices.shape[-1])).view(batch_size)
+    frob_ratio = torch.clamp(frob_norm / (trace + 1e-8), 1.0, 1e12)
+    
+    # Take the maximum of both estimates for safety
+    return torch.max(diag_ratio, frob_ratio)
 
-# ===================== #
-# Optimized Precision Functions
-# ===================== #
+@script
+def stable_softmax_jit(logits, temperature: float = 1.0)-> torch.Tensor:
+    """JIT-compiled stable softmax"""
+    if temperature != 1.0:
+        logits = logits / temperature
+    
+    logits_max = torch.max(logits, dim=-1, keepdim=True)[0]
+    logits_stable = logits - logits_max
+    logits_clamped = torch.clamp(logits_stable, min=-100, max=100)
+    
+    return F.softmax(logits_clamped, dim=-1)
+
+#----------------------------------------------#
+#### Precision Matrix Functions ####
+#----------------------------------------------#
 def vectors_to_precision_optimized(vectors, dim, base_epsilon=DEFAULT_EPSILON):
     """
     Highly optimized version with minimal redundant operations
@@ -112,6 +135,7 @@ def vectors_to_precision_optimized_new(vectors, dim, base_epsilon=DEFAULT_EPSILO
     """
     if torch.isnan(vectors).any():
         print("❌ NaNs in vectors before conversion to precision!")
+        vectors = torch.nan_to_num(vectors, nan=0.0, posinf=1.0, neginf=-1.0)
     
     batch_size = vectors.shape[0]
     device = vectors.device
@@ -137,6 +161,7 @@ def vectors_to_precision_optimized_new(vectors, dim, base_epsilon=DEFAULT_EPSILO
 
     # Single-pass regularization
     adaptive_eps = adaptive_regularization_fast_new(C, base_epsilon)
+    adaptive_eps = torch.clamp(adaptive_eps, min=base_epsilon * 5)  # More aggressive minimum
     eye = torch.eye(dim, device=device, dtype=dtype)
     precision = C + adaptive_eps * eye
     
@@ -152,34 +177,53 @@ def vectors_to_precision_chunked_optimized_new(vectors, dim, base_epsilon=DEFAUL
         results.append(result)
         # KEEP - Major chunk processing
         del chunk, result
-        if i % (chunk_size * 4) == 0:  # Less frequent cache clearing
+        if i % (chunk_size * DEFAULT_CLEAR_CACHE_FREQUENCY) == 0:  # Less frequent cache clearing
             torch.cuda.empty_cache()
     return torch.cat(results, dim=0)
 
-# ===================== #
-# Optimized Computation Functions
-# ===================== #
+def vectors_to_precision_precomputed(vectors, dim, base_epsilon=DEFAULT_EPSILON,
+                                     eye=PRECISION_EYE, tril_indices=TRIL_INDICES):
+    batch_size = vectors.shape[0]
+    device = vectors.device
+    dtype = vectors.dtype
 
-def adaptive_regularization_fast(matrices, base_epsilon=DEFAULT_EPSILON, max_cond=DEFAULT_MAX_COND):
-    """
-    Faster adaptive regularization using pre-computed condition estimates
-    """
-    batch_size = matrices.shape[0]
-    device = matrices.device
-    dtype = matrices.dtype
-    
-    try:
-        # Use Frobenius norm ratio as a fast condition number estimate
-        # This avoids expensive SVD in torch.linalg.cond
-        diag_norm = torch.norm(torch.diagonal(matrices, dim1=-2, dim2=-1), dim=-1)
-        frob_norm = torch.norm(matrices.view(batch_size, -1), dim=-1)
-        cond_estimate = torch.clamp(frob_norm / (diag_norm + 1e-8), 1.0, max_cond)
-        
-        adaptive_eps = base_epsilon * torch.sqrt(cond_estimate / 1e6)
-        return adaptive_eps.view(-1, 1, 1)  # Use view instead of unsqueeze
-    except:
-        return torch.full((batch_size, 1, 1), base_epsilon, device=device, dtype=dtype)
+    # Allocate L
+    L = torch.zeros(batch_size, dim, dim, dtype=dtype, device=device)
 
+    # Fill lower-triangular part
+    L[:, tril_indices[0], tril_indices[1]] = vectors
+
+    # Out-of-place softplus on diagonal
+    diag = F.softplus(L.diagonal(dim1=-2, dim2=-1)) + 1e-6
+    L = L + torch.diag_embed(diag - L.diagonal(dim1=-2, dim2=-1))
+
+    # Covariance
+    C = torch.bmm(L, L.transpose(-2, -1))
+
+    # Adaptive regularization
+    adaptive_eps = adaptive_regularization_fast_new(C, base_epsilon)
+    adaptive_eps = torch.clamp(adaptive_eps, min=base_epsilon*5)
+
+    # Precision
+    precision = C + adaptive_eps * eye.to(device=C.device, dtype=C.dtype)
+
+    return precision
+
+def vectors_to_precision_precomputed_chunked(vectors, dim, base_epsilon=DEFAULT_EPSILON, chunk_size=DEFAULT_CENTERS_CHUNK_SIZE, eye=PRECISION_EYE, tril_indices=TRIL_INDICES):
+    results = []
+    for i in range(0, vectors.size(0), chunk_size):
+        chunk = vectors[i:i+chunk_size]
+        result = vectors_to_precision_precomputed(chunk, dim, base_epsilon, eye, tril_indices)
+        results.append(result)
+        # KEEP - Major chunk processing
+        del chunk, result
+        if i % (chunk_size * DEFAULT_CLEAR_CACHE_FREQUENCY) == 0:  # Less frequent cache clearing
+            torch.cuda.empty_cache()
+    return torch.cat(results, dim=0)
+
+#----------------------------------------------#
+#### Computation Functions ####
+#----------------------------------------------#
 def adaptive_regularization_fast_new(matrices, base_epsilon=DEFAULT_EPSILON, max_cond=DEFAULT_MAX_COND):
     """
     Faster adaptive regularization using JIT-compiled condition estimates
@@ -199,34 +243,6 @@ def adaptive_regularization_fast_new(matrices, base_epsilon=DEFAULT_EPSILON, max
     
     except Exception:
         return torch.full((batch_size, 1, 1), base_epsilon, device=device, dtype=dtype)
-
-def stable_logdet_fast(matrices, eps=1e-6):
-    """
-    Fast log determinant using diagonal decomposition heuristic
-    """
-    batch_size = matrices.shape[0]
-    device = matrices.device
-    dtype = matrices.dtype
-    
-    # Fast approximation: use diagonal elements for log determinant
-    # This is much faster than Cholesky decomposition
-    diag_elements = torch.diagonal(matrices, dim1=-2, dim2=-1)
-    diag_elements = torch.clamp(diag_elements, min=eps)
-    logdet_approx = torch.sum(torch.log(diag_elements), dim=-1)
-    
-    return logdet_approx
-
-@script
-def stable_softmax_jit(logits, temperature: float = 1.0)-> torch.Tensor:
-    """JIT-compiled stable softmax"""
-    if temperature != 1.0:
-        logits = logits / temperature
-    
-    logits_max = torch.max(logits, dim=-1, keepdim=True)[0]
-    logits_stable = logits - logits_max
-    logits_clamped = torch.clamp(logits_stable, min=-50.0, max=50.0)
-    
-    return F.softmax(logits_clamped, dim=-1)
 
 def stable_logdet(matrices, eps=1e-6, max_attempts=DEFAULT_MAX_ATTEMPTS):
     """
@@ -260,7 +276,55 @@ def stable_logdet(matrices, eps=1e-6, max_attempts=DEFAULT_MAX_ATTEMPTS):
         # Ultimate fallback: return safe default values
         return torch.full((batch_size,), -10.0, device=device, dtype=dtype)
 
-def stable_softmax(logits, temperature=1.0, dim=-1):
+def stable_logdet_hybrid(matrices, eps=1e-6, max_attempts=DEFAULT_MAX_ATTEMPTS):
+    """
+    Fast and stable log-determinant computation for small matrices.
+    Uses per-matrix Cholesky when possible, with fallback to slogdet.S
+    
+    matrices: (B, D, D) tensor
+    eps: base regularization
+    max_attempts: number of regularization retries
+    """
+    batch_size, dim, _ = matrices.shape
+    device, dtype = matrices.device, matrices.dtype
+    I = torch.eye(dim, device=device, dtype=dtype)
+    logdet = torch.empty(batch_size, device=device, dtype=dtype)
+
+    for i in range(batch_size):
+        for attempt in range(max_attempts):
+            current_eps = eps * (10 ** attempt)
+            try:
+                L = torch.linalg.cholesky(matrices[i] + current_eps * I)
+                logdet[i] = 2.0 * torch.sum(torch.log(torch.diagonal(L)))
+                break  # success, exit attempt loop
+            except RuntimeError:
+                # fallback to slogdet
+                sign, ld = torch.linalg.slogdet(matrices[i] + current_eps * I)
+                if sign > 0:
+                    logdet[i] = ld
+                    break
+                elif attempt == max_attempts - 1:
+                    # final fallback for pathological matrices
+                    logdet[i] = -1e10
+    return logdet
+
+def stable_softmax(logits, temperature=1.0, dim=-1, eps=1e-8):
+    """
+    Numerically stable softmax with temperature scaling
+    """
+    # Scale by temperature
+    logits_scaled = logits / temperature
+    
+    # Subtract max for numerical stability
+    logits_max = torch.max(logits_scaled, dim=dim, keepdim=True)[0]
+    logits_stable = logits_scaled - logits_max
+    
+    # Clamp to prevent extreme values
+    logits_clamped = torch.clamp(logits_stable, min=-DEFAULT_LOGITS_CLAMP, max=DEFAULT_LOGITS_CLAMP)
+    
+    return F.softmax(logits_clamped, dim=dim)
+
+def stable_softmax_optimized(logits, temperature=1.0, dim=-1):
     """
     Optimized stable softmax with fewer operations
     """
@@ -273,52 +337,24 @@ def stable_softmax(logits, temperature=1.0, dim=-1):
     
     return F.softmax(logits_stable, dim=dim)
 
-def stable_logdet_memory_efficient(matrices, eps=1e-6):
+def stable_softmax_inplace(logits, temperature=1.0, dim=-1):
     """
-    Memory-efficient log determinant computation
+    Memory-efficient stable softmax
     """
-    batch_size = matrices.shape[0]
-    device = matrices.device
-    dtype = matrices.dtype
+    if temperature != 1.0:
+        logits = logits / temperature
     
-    # Process in micro-batches to save memory
-    micro_batch_size = min(8, batch_size)
-    results = []
+    # In-place operations where possible
+    logits_max = torch.max(logits, dim=dim, keepdim=True)[0]
+    logits.sub_(logits_max)  # In-place subtraction
+    logits.clamp_(min=-DEFAULT_LOGITS_CLAMP, max=DEFAULT_LOGITS_CLAMP)  # In-place clamping
     
-    for i in range(0, batch_size, micro_batch_size):
-        end_idx = min(i + micro_batch_size, batch_size)
-        batch_matrices = matrices[i:end_idx]
-        
-        try:
-            # Add minimal regularization
-            eye = torch.eye(batch_matrices.shape[-1], device=device, dtype=dtype)
-            regularized = batch_matrices + eps * eye
-            
-            # Use Cholesky for stability
-            chol = torch.linalg.cholesky(regularized)
-            logdet_batch = 2.0 * torch.sum(torch.log(torch.diagonal(chol, dim1=-2, dim2=-1) + 1e-8), dim=-1)
-            
-            results.append(logdet_batch.cpu())  # Move to CPU immediately
-            del batch_matrices, regularized, chol, logdet_batch
-            
-        except RuntimeError:
-            # Fallback for problematic matrices
-            fallback = torch.full((end_idx - i,), -10.0, device=device, dtype=dtype)
-            results.append(fallback.cpu())
-            del fallback
-        
-        aggressive_cleanup()
-    
-    # Concatenate results
-    cpu_result = torch.cat(results, dim=0)
-    del results
-    return cpu_result.to(device)
+    return F.softmax(logits, dim=dim)
 
-# ===================== #
-# Optimized Loss Functions
-# ===================== #
-#original ones (fastest, least memory efficient)
-def grad_and_laplacian_mog_density_stable(x, means, precisions, temperature: float =1.0):
+#----------------------------------------------#
+#### Loss Functions ####
+#----------------------------------------------#
+def grad_and_laplacian_mog_density_stable(x, means, precisions, temperature=1.0):
     """
     Optimized numerically stable version of gradient and Laplacian computation
     """
@@ -336,12 +372,14 @@ def grad_and_laplacian_mog_density_stable(x, means, precisions, temperature: flo
     squared_linear = torch.sum(x_mean_cov.square(), dim=-1)  # (B, K) - faster than * multiplication
     
     # Precompute and cache log determinant and trace
-    logdet = stable_logdet(precisions)  # (K,)
+    #logdet = stable_logdet(precisions)  # (K,)
+    logdet = stable_logdet_hybrid(precisions)
     trace_precision = torch.diagonal(precisions, dim1=-2, dim2=-1).sum(dim=-1)  # (K,)
     
     # Vectorized expansion (faster than .expand())
     logdet_expanded = logdet.unsqueeze(0).expand(batch_size, -1)  # (B, K)
     trace_expanded = trace_precision.unsqueeze(0).expand(batch_size, -1)  # (B, K)
+
 
     # Compute log probabilities with numerical stability
     log_probs = 0.5 * (logdet_expanded - squared_linear) - 0.5 * dim * torch.log(
@@ -351,7 +389,7 @@ def grad_and_laplacian_mog_density_stable(x, means, precisions, temperature: flo
     log_probs = torch.clamp(log_probs, min=-DEFAULT_LOGPROB_CLAMP, max=DEFAULT_LOGPROB_CLAMP)
     
     # Compute stable softmax probabilities
-    softmax_probs = stable_softmax(log_probs, temperature=temperature, dim=1)  # (B, K)
+    softmax_probs = stable_softmax_jit(log_probs, temperature=temperature)  # (B, K)
     
     # GRADIENT COMPUTATION - vectorized
     gradient = -torch.sum(softmax_probs.unsqueeze(-1) * x_mean_cov, dim=1)  # (B, D)
@@ -435,7 +473,8 @@ def grad_and_laplacian_mog_density_component_chunked_stable(x, means, precisions
         squared_linear = torch.sum(x_mean_cov.square(), dim=-1)  # Use .square() instead of *
         
         # Precompute log_det and trace for chunk
-        log_det = stable_logdet(precisions_chunk)  # (K_chunk,)
+        #log_det = stable_logdet(precisions_chunk)  # (K_chunk,)
+        log_det = stable_logdet_hybrid(precisions_chunk)  # (K_chunk,)
         trace_chunk = torch.diagonal(precisions_chunk, dim1=-2, dim2=-1).sum(dim=-1)  # (K_chunk,)
         
         # Broadcast efficiently
@@ -461,499 +500,14 @@ def grad_and_laplacian_mog_density_component_chunked_stable(x, means, precisions
             torch.cuda.empty_cache()
     
     # Final computations
-    softmax_probs = stable_softmax(all_log_probs, temperature=temperature, dim=1) 
-    
+    #softmax_probs = stable_softmax_optimized(all_log_probs, temperature=temperature, dim=1) #optimized version uses less ram and is faster
+    softmax_probs = stable_softmax_jit(all_log_probs, temperature=temperature)
     gradient = torch.sum(softmax_probs.unsqueeze(-1) * all_weighted_gradients, dim=1)
     
     laplacian_component = softmax_probs * (all_squared_linear - all_trace_precision)
     laplacian_over_density = torch.sum(laplacian_component, dim=1)
     
     return gradient, laplacian_over_density
-
-# most memory efficient versions (offloading)
-def grad_and_laplacian_mog_density_ultra_chunked(x, means, precisions, 
-                                                 batch_chunk_size=8, 
-                                                 component_chunk_size=10,
-                                                 temperature=1.0):
-    """
-    Ultra memory-efficient version with micro-chunking and CPU offloading
-    """
-    total_batches = x.size(0)
-    dim = x.size(-1)
-    device = x.device
-    dtype = x.dtype
-    
-    print(f"Processing {total_batches} samples with {means.size(0)} components")
-    
-    # Pre-allocate results on CPU to save GPU memory
-    gradients_cpu = torch.empty(total_batches, dim, dtype=dtype)
-    laplacians_cpu = torch.empty(total_batches, dtype=dtype)
-    
-    # Process in micro-batches
-    for start in range(0, total_batches, batch_chunk_size):
-        end = min(start + batch_chunk_size, total_batches)
-        x_chunk = x[start:end]
-        if start % 4 == 0:
-            print(f"Processing batch {start//batch_chunk_size + 1}/{(total_batches + batch_chunk_size - 1)//batch_chunk_size}")
-        
-        # Ultra-chunked component processing
-        grad_chunk, laplacian_chunk = grad_and_laplacian_ultra_component_chunked(
-            x_chunk, means, precisions, chunk_size=component_chunk_size, temperature=temperature)
-        
-        # Store results on CPU
-        gradients_cpu[start:end] = grad_chunk.cpu()
-        laplacians_cpu[start:end] = laplacian_chunk.cpu()
-        
-        # Aggressive cleanup
-        del x_chunk, grad_chunk, laplacian_chunk
-        aggressive_cleanup()
-    
-    # Move final results back to GPU
-    gradients = gradients_cpu.to(device)
-    laplacians = laplacians_cpu.to(device)
-    del gradients_cpu, laplacians_cpu
-    
-    return gradients, laplacians
-
-def grad_and_laplacian_mog_density_ultra_chunked_multigpu(x, means, precisions, 
-                                                          batch_chunk_size=8, 
-                                                          component_chunk_size=10,
-                                                          temperature=1.0,
-                                                          compute_device="cuda:1"):
-    """
-    Ultra memory-efficient version with micro-chunking and secondary GPU offloading (instead of CPU)
-    """
-    total_batches = x.size(0)
-    dim = x.size(-1)
-    input_device = x.device
-    dtype = x.dtype
-    
-    print(f"Processing {total_batches} samples with {means.size(0)} components")
-
-    # Allocate results directly on input device (e.g., cuda:0)
-    gradients = torch.empty(total_batches, dim, dtype=dtype, device=input_device)
-    laplacians = torch.empty(total_batches, dtype=dtype, device=input_device)
-
-    # Use specified compute device (e.g., cuda:1)
-    compute_device = torch.device(compute_device)
-
-    for start in range(0, total_batches, batch_chunk_size):
-        end = min(start + batch_chunk_size, total_batches)
-        x_chunk = x[start:end].to(compute_device, non_blocking=True)
-        
-        if start % (4 * batch_chunk_size) == 0:
-            print(f"Processing batch {start//batch_chunk_size + 1}/{(total_batches + batch_chunk_size - 1)//batch_chunk_size}")
-        
-        # Move means/precisions if needed (assume they’re on same device as x originally)
-        
-        grad_chunk, laplacian_chunk = grad_and_laplacian_ultra_component_chunked_multigpu(
-            x_chunk,
-            means.to(compute_device, non_blocking=True),
-            precisions.to(compute_device, non_blocking=True),
-            chunk_size=component_chunk_size,
-            temperature=temperature
-        )
-        
-        # Move result back to input device
-        gradients[start:end] = grad_chunk.to(input_device, non_blocking=True)
-        laplacians[start:end] = laplacian_chunk.to(input_device, non_blocking=True)
-        
-        del x_chunk, grad_chunk, laplacian_chunk
-        torch.cuda.empty_cache()
-        aggressive_cleanup()
-    
-    return gradients, laplacians
-
-def grad_and_laplacian_mog_density_ultra_chunked_stream(
-    x, means, precisions, 
-    batch_chunk_size=8, 
-    component_chunk_size=10,
-    temperature=1.0,
-    compute_device=torch.device("cuda:1"),
-):
-    """
-    Ultra memory-efficient version with micro-chunking and secondary GPU offloading (e.g., GPU 1).
-    """
-    total_batches = x.size(0)
-    dim = x.size(-1)
-    input_device = x.device
-    dtype = x.dtype
-
-    print(f"Processing {total_batches} samples with {means.size(0)} components")
-
-    # Allocate final output tensors on input device
-    gradients = torch.empty(total_batches, dim, dtype=dtype, device=input_device)
-    laplacians = torch.empty(total_batches, dtype=dtype, device=input_device)
-
-    # Move GMM parameters once to compute device (if not already)
-    means = means.to(compute_device, non_blocking=True)
-    precisions = precisions.to(compute_device, non_blocking=True)
-
-    for start in range(0, total_batches, batch_chunk_size):
-        end = min(start + batch_chunk_size, total_batches)
-        x_chunk = x[start:end]
-
-        if start % (4 * batch_chunk_size) == 0:
-            print(f"Processing batch {start // batch_chunk_size + 1}/{(total_batches + batch_chunk_size - 1) // batch_chunk_size}")
-
-        # Offload chunked computation to secondary GPU
-        grad_chunk, laplacian_chunk = grad_and_laplacian_dual_gpu_streamed(
-            x_chunk,
-            means,
-            precisions,
-            chunk_size=component_chunk_size,
-            temperature=temperature,
-            gmm_device=compute_device,
-            main_device=input_device,
-        )
-
-        gradients[start:end] = grad_chunk
-        laplacians[start:end] = laplacian_chunk
-
-        # Cleanup
-        del x_chunk, grad_chunk, laplacian_chunk
-        torch.cuda.empty_cache()
-        aggressive_cleanup()
-
-    return gradients, laplacians
-
-def grad_and_laplacian_ultra_component_chunked(x, means, precisions, chunk_size=10, temperature=1.0):
-    """
-    Ultra memory-efficient component chunking with CPU offloading
-    """
-    batch_size, dim = x.shape
-    num_components = means.shape[0]
-    device = x.device
-    dtype = x.dtype
-    
-    # Store intermediate results on CPU
-    log_probs_cpu = torch.empty(batch_size, num_components, dtype=dtype)
-    weighted_grads_cpu = torch.empty(batch_size, num_components, dim, dtype=dtype)
-    squared_linear_cpu = torch.empty(batch_size, num_components, dtype=dtype)
-    trace_precision_cpu = torch.empty(batch_size, num_components, dtype=dtype)
-    
-    # Pre-compute constants
-    log_2pi = torch.log(torch.tensor(2 * torch.pi, device=device, dtype=dtype))
-    
-    # Process components in micro-chunks
-    for start in range(0, num_components, chunk_size):
-        end = min(start + chunk_size, num_components)
-        
-        # Move only current chunk to GPU
-        means_chunk = means[start:end].to(device)
-        precisions_chunk = precisions[start:end].to(device)
-        
-        # Compute for current chunk
-        x_expanded = x.unsqueeze(1)
-        x_mean = x_expanded - means_chunk
-        
-        # Use checkpoint to trade compute for memory
-        def compute_chunk(x_mean, precisions_chunk):
-            x_mean_cov = torch.einsum("kij,bkj->bki", precisions_chunk, x_mean)
-            squared_linear = torch.sum(x_mean_cov.square(), dim=-1)
-            return x_mean_cov, squared_linear
-        
-        x_mean_cov, squared_linear = checkpoint(compute_chunk, x_mean, precisions_chunk, use_reentrant=False)
-        
-        # Compute log determinant for chunk
-        log_det = stable_logdet_memory_efficient(precisions_chunk)
-        trace_chunk = torch.diagonal(precisions_chunk, dim1=-2, dim2=-1).sum(dim=-1)
-        
-        # Compute log probabilities
-        log_det_expanded = log_det.unsqueeze(0).expand(batch_size, -1)
-        trace_expanded = trace_chunk.unsqueeze(0).expand(batch_size, -1)
-        
-        log_probs_chunk = 0.5 * (log_det_expanded - squared_linear) - 0.5 * dim * log_2pi
-        log_probs_chunk = torch.clamp(log_probs_chunk, min=-DEFAULT_LOGPROB_CLAMP, max=DEFAULT_LOGPROB_CLAMP)
-        
-        weighted_gradient_chunk = -x_mean_cov
-        
-        # Store on CPU immediately
-        log_probs_cpu[:, start:end] = log_probs_chunk.detach().cpu()
-        weighted_grads_cpu[:, start:end] = weighted_gradient_chunk.cpu()
-        squared_linear_cpu[:, start:end] = squared_linear.cpu()
-        trace_precision_cpu[:, start:end] = trace_expanded.cpu()
-        
-        # Aggressive cleanup
-        del means_chunk, precisions_chunk, x_mean, x_mean_cov, squared_linear
-        del log_det, trace_chunk, log_probs_chunk, weighted_gradient_chunk
-        aggressive_cleanup()
-    
-    # Move results back to GPU for final computation
-    all_log_probs = log_probs_cpu.to(device)
-    all_weighted_gradients = weighted_grads_cpu.to(device)
-    all_squared_linear = squared_linear_cpu.to(device)
-    all_trace_precision = trace_precision_cpu.to(device)
-    
-    # Clean up CPU tensors
-    del log_probs_cpu, weighted_grads_cpu, squared_linear_cpu, trace_precision_cpu
-    
-    # Final computations
-    softmax_probs = stable_softmax(all_log_probs, temperature=temperature, dim=1)
-    
-    gradient = torch.sum(softmax_probs.unsqueeze(-1) * all_weighted_gradients, dim=1)
-    
-    laplacian_component = softmax_probs * (all_squared_linear - all_trace_precision)
-    laplacian_over_density = torch.sum(laplacian_component, dim=1)
-    
-    return gradient, laplacian_over_density
-
-#checkpointed versions
-def grad_and_laplacian_mog_density_component_chunked_checkpointed(x, means, precisions, 
-                                                                 chunk_size=DEFAULT_CENTERS_CHUNK_SIZE, 
-                                                                 temperature=1.0):
-    """
-    Memory-efficient component chunking with gradient checkpointing
-    """
-    batch_size, dim = x.shape
-    num_components = means.shape[0]
-    
-    # Pre-allocate tensors for accumulation (same as original)
-    all_log_probs = torch.empty(batch_size, num_components, dtype=x.dtype, device=x.device)
-    all_weighted_gradients = torch.empty(batch_size, num_components, dim, dtype=x.dtype, device=x.device)
-    all_squared_linear = torch.empty(batch_size, num_components, dtype=x.dtype, device=x.device)
-    all_trace_precision = torch.empty(batch_size, num_components, dtype=x.dtype, device=x.device)
-    
-    # Pre-compute constants
-    log_2pi = torch.log(torch.tensor(2 * torch.pi, device=x.device, dtype=x.dtype))
-    
-    # Define checkpointed computation for each chunk
-    def compute_chunk_core(x, means_chunk, precisions_chunk, log_2pi_const, dim_const):
-        """
-        Core computation that will be checkpointed
-        This contains the memory-intensive operations
-        """
-        # Vectorized operations
-        x_expanded = x.unsqueeze(1)  # (B, 1, D)
-        x_mean = x_expanded - means_chunk  # (B, K_chunk, D)
-        
-        # Memory-intensive einsum
-        x_mean_cov = torch.einsum("kij,bkj->bki", precisions_chunk, x_mean)
-        squared_linear = torch.sum(x_mean_cov.square(), dim=-1)
-        
-        # Precompute log_det and trace for chunk
-        log_det = stable_logdet(precisions_chunk)  # (K_chunk,)
-        trace_chunk = torch.diagonal(precisions_chunk, dim1=-2, dim2=-1).sum(dim=-1)  # (K_chunk,)
-        
-        # Broadcast efficiently
-        batch_size = x.shape[0]
-        log_det_expanded = log_det.unsqueeze(0).expand(batch_size, -1)
-        trace_expanded = trace_chunk.unsqueeze(0).expand(batch_size, -1)
-        
-        # Compute log probabilities
-        log_probs_chunk = 0.5 * (log_det_expanded - squared_linear) - 0.5 * dim_const * log_2pi_const
-        log_probs_chunk = torch.clamp(log_probs_chunk, min=-DEFAULT_LOGPROB_CLAMP, max=DEFAULT_LOGPROB_CLAMP)
-        
-        weighted_gradient_chunk = -x_mean_cov
-        
-        return log_probs_chunk, weighted_gradient_chunk, squared_linear, trace_expanded
-    
-    # Process chunks with checkpointing
-    for start in range(0, num_components, chunk_size):
-        end = min(start + chunk_size, num_components)
-        
-        means_chunk = means[start:end]
-        precisions_chunk = precisions[start:end]
-        
-        # Use gradient checkpointing for memory-intensive core computation
-        log_probs_chunk, weighted_gradient_chunk, squared_linear, trace_expanded = checkpoint(
-            compute_chunk_core, 
-            x, 
-            means_chunk, 
-            precisions_chunk, 
-            log_2pi,
-            dim,
-            use_reentrant=False
-        )
-        
-        # Direct assignment to pre-allocated tensors
-        all_log_probs[:, start:end] = log_probs_chunk
-        all_weighted_gradients[:, start:end] = weighted_gradient_chunk
-        all_squared_linear[:, start:end] = squared_linear
-        all_trace_precision[:, start:end] = trace_expanded
-        
-        # Clean up chunk-specific tensors
-        del log_probs_chunk, weighted_gradient_chunk, squared_linear, trace_expanded
-        
-        # Less frequent cache clearing
-        if start % (chunk_size * 5) == 0:
-            torch.cuda.empty_cache()
-    
-    # Final computations (same as original)
-    softmax_probs = stable_softmax(all_log_probs, temperature=temperature, dim=1)
-    
-    gradient = torch.sum(softmax_probs.unsqueeze(-1) * all_weighted_gradients, dim=1)
-    
-    laplacian_component = softmax_probs * (all_squared_linear - all_trace_precision)
-    laplacian_over_density = torch.sum(laplacian_component, dim=1)
-    
-    return gradient, laplacian_over_density
-
-def grad_and_laplacian_mog_density_component_chunked_ultra_checkpointed(x, means, precisions, 
-                                                                       chunk_size=DEFAULT_CENTERS_CHUNK_SIZE, 
-                                                                       temperature=1.0):
-    """
-    Ultra memory-efficient version with more aggressive checkpointing
-    """
-    batch_size, dim = x.shape
-    num_components = means.shape[0]
-    
-    # Store results on CPU to save GPU memory
-    all_log_probs_cpu = torch.empty(batch_size, num_components, dtype=x.dtype)
-    all_weighted_gradients_cpu = torch.empty(batch_size, num_components, dim, dtype=x.dtype)
-    all_squared_linear_cpu = torch.empty(batch_size, num_components, dtype=x.dtype)
-    all_trace_precision_cpu = torch.empty(batch_size, num_components, dtype=x.dtype)
-    
-    # Pre-compute constants
-    log_2pi = torch.log(torch.tensor(2 * torch.pi, device=x.device, dtype=x.dtype))
-    
-    def compute_chunk_ultra_core(x, means_chunk, precisions_chunk, log_2pi_const, dim_const):
-        """
-        Ultra-checkpointed core computation
-        """
-        # Split into even smaller sub-operations for maximum memory efficiency
-        def compute_x_mean_cov(x, means_chunk, precisions_chunk):
-            x_expanded = x.unsqueeze(1)
-            x_mean = x_expanded - means_chunk
-            x_mean_cov = torch.einsum("kij,bkj->bki", precisions_chunk, x_mean)
-            return x_mean_cov, x_mean
-        
-        def compute_probabilities(x_mean_cov, precisions_chunk, log_2pi_const, dim_const):
-            squared_linear = torch.sum(x_mean_cov.square(), dim=-1)
-            log_det = stable_logdet(precisions_chunk)
-            trace_chunk = torch.diagonal(precisions_chunk, dim1=-2, dim2=-1).sum(dim=-1)
-            
-            batch_size = x_mean_cov.shape[0]
-            log_det_expanded = log_det.unsqueeze(0).expand(batch_size, -1)
-            trace_expanded = trace_chunk.unsqueeze(0).expand(batch_size, -1)
-            
-            log_probs_chunk = 0.5 * (log_det_expanded - squared_linear) - 0.5 * dim_const * log_2pi_const
-            log_probs_chunk = torch.clamp(log_probs_chunk, min=-DEFAULT_LOGPROB_CLAMP, max=DEFAULT_LOGPROB_CLAMP)
-            
-            return log_probs_chunk, squared_linear, trace_expanded
-        
-        # Checkpoint each sub-operation
-        x_mean_cov, x_mean = checkpoint(compute_x_mean_cov, x, means_chunk, precisions_chunk, use_reentrant=False)
-        log_probs_chunk, squared_linear, trace_expanded = checkpoint(
-            compute_probabilities, x_mean_cov, precisions_chunk, log_2pi_const, dim_const, use_reentrant=False)
-        
-        weighted_gradient_chunk = -x_mean_cov
-        
-        return log_probs_chunk, weighted_gradient_chunk, squared_linear, trace_expanded
-    
-    # Process chunks with ultra-checkpointing
-    for start in range(0, num_components, chunk_size):
-        end = min(start + chunk_size, num_components)
-        
-        means_chunk = means[start:end]
-        precisions_chunk = precisions[start:end]
-        
-        # Use ultra-checkpointing
-        log_probs_chunk, weighted_gradient_chunk, squared_linear, trace_expanded = checkpoint(
-            compute_chunk_ultra_core, 
-            x, 
-            means_chunk, 
-            precisions_chunk, 
-            log_2pi,
-            dim,
-            use_reentrant=False
-        )
-        
-        # Store on CPU immediately
-        all_log_probs_cpu[:, start:end] = log_probs_chunk.cpu()
-        all_weighted_gradients_cpu[:, start:end] = weighted_gradient_chunk.cpu()
-        all_squared_linear_cpu[:, start:end] = squared_linear.cpu()
-        all_trace_precision_cpu[:, start:end] = trace_expanded.cpu()
-        
-        # Aggressive cleanup
-        del log_probs_chunk, weighted_gradient_chunk, squared_linear, trace_expanded
-        torch.cuda.empty_cache()
-    
-    # Move results back to GPU for final computation
-    device = x.device
-    all_log_probs = all_log_probs_cpu.to(device)
-    all_weighted_gradients = all_weighted_gradients_cpu.to(device)
-    all_squared_linear = all_squared_linear_cpu.to(device)
-    all_trace_precision = all_trace_precision_cpu.to(device)
-    
-    # Clean up CPU tensors
-    del all_log_probs_cpu, all_weighted_gradients_cpu, all_squared_linear_cpu, all_trace_precision_cpu
-    
-    # Final computations
-    softmax_probs = stable_softmax(all_log_probs, temperature=temperature, dim=1)
-    
-    gradient = torch.sum(softmax_probs.unsqueeze(-1) * all_weighted_gradients, dim=1)
-    
-    laplacian_component = softmax_probs * (all_squared_linear - all_trace_precision)
-    laplacian_over_density = torch.sum(laplacian_component, dim=1)
-    
-    return gradient, laplacian_over_density
-
-def grad_and_laplacian_mog_density_chunked_checkpointed(x, means, precisions, 
-                                                       batch_chunk_size=DEFAULT_BATCH_CHUNK_SIZE, 
-                                                       component_chunk_size=DEFAULT_CENTERS_CHUNK_SIZE,
-                                                       temperature=1.0):
-    """
-    Updated chunked version that uses checkpointed component processing
-    """
-    total_batches = x.size(0)
-    dim = x.size(-1)
-    
-    gradients = torch.empty(total_batches, dim, dtype=x.dtype, device=x.device)
-    laplacians = torch.empty(total_batches, dtype=x.dtype, device=x.device)
-    
-    # Process in chunks
-    for start in range(0, total_batches, batch_chunk_size):
-        end = min(start + batch_chunk_size, total_batches)
-        x_chunk = x[start:end]
-        
-        # Use checkpointed component chunking for large numbers of components
-        if means.size(0) > component_chunk_size:
-            grad_chunk, laplacian_chunk = grad_and_laplacian_mog_density_component_chunked_checkpointed(
-                x_chunk, means, precisions, chunk_size=component_chunk_size, temperature=temperature)
-        else:
-            # For small numbers of components, use regular stable version
-            grad_chunk, laplacian_chunk = grad_and_laplacian_mog_density_stable(
-                x_chunk, means, precisions, temperature=temperature)
-        
-        # Direct assignment
-        gradients[start:end] = grad_chunk.detach() if not grad_chunk.requires_grad else grad_chunk
-        laplacians[start:end] = laplacian_chunk.detach() if not laplacian_chunk.requires_grad else laplacian_chunk
-    
-    return gradients, laplacians
-
-def grad_and_laplacian_mog_density_chunked_ultra_checkpointed(x, means, precisions, 
-                                                       batch_chunk_size=DEFAULT_BATCH_CHUNK_SIZE, 
-                                                       component_chunk_size=DEFAULT_CENTERS_CHUNK_SIZE,
-                                                       temperature=1.0):
-    """
-    Updated chunked version that uses checkpointed component processing
-    """
-    total_batches = x.size(0)
-    dim = x.size(-1)
-    
-    gradients = torch.empty(total_batches, dim, dtype=x.dtype, device=x.device)
-    laplacians = torch.empty(total_batches, dtype=x.dtype, device=x.device)
-    
-    # Process in chunks
-    for start in range(0, total_batches, batch_chunk_size):
-        end = min(start + batch_chunk_size, total_batches)
-        x_chunk = x[start:end]
-        
-        # Use checkpointed component chunking for large numbers of components
-        if means.size(0) > component_chunk_size:
-            grad_chunk, laplacian_chunk = grad_and_laplacian_mog_density_component_chunked_ultra_checkpointed(
-                x_chunk, means, precisions, chunk_size=component_chunk_size, temperature=temperature)
-        else:
-            # For small numbers of components, use regular stable version
-            grad_chunk, laplacian_chunk = grad_and_laplacian_mog_density_stable(
-                x_chunk, means, precisions, temperature=temperature)
-        
-        # Direct assignment
-        gradients[start:end] = grad_chunk.detach() if not grad_chunk.requires_grad else grad_chunk
-        laplacians[start:end] = laplacian_chunk.detach() if not laplacian_chunk.requires_grad else laplacian_chunk
-    
-    return gradients, laplacians
 
 # Alternative: Ultra-fast version for when you can afford more memory
 def grad_and_laplacian_mog_density_vectorized(x, means, precisions, temperature=1.0):
@@ -973,7 +527,8 @@ def grad_and_laplacian_mog_density_vectorized(x, means, precisions, temperature=
     squared_linear = torch.sum(x_mean_cov.square(), dim=-1)
     
     # Precompute all constants
-    logdet = stable_logdet(precisions)
+    #logdet = stable_logdet(precisions)
+    logdet = stable_logdet_hybrid(precisions)
     trace_precision = torch.diagonal(precisions, dim1=-2, dim2=-1).sum(dim=-1)
     log_2pi_term = 0.5 * dim * torch.log(torch.tensor(2 * torch.pi, device=x.device, dtype=x.dtype))
     
@@ -982,8 +537,10 @@ def grad_and_laplacian_mog_density_vectorized(x, means, precisions, temperature=
     log_probs = torch.clamp(log_probs, min=-DEFAULT_LOGPROB_CLAMP, max=DEFAULT_LOGPROB_CLAMP)
     
     # Stable softmax
-    softmax_probs = stable_softmax(log_probs, temperature=temperature, dim=1)
-    
+    #softmax_probs = stable_softmax_optimized(log_probs, temperature=temperature, dim=1)
+    softmax_probs = stable_softmax_jit(all_log_probs, temperature=temperature)
+
+
     # Vectorized gradient and Laplacian
     gradient = -torch.sum(softmax_probs.unsqueeze(-1) * x_mean_cov, dim=1)
     laplacian_component = softmax_probs * (squared_linear - trace_precision.unsqueeze(0))
@@ -991,421 +548,330 @@ def grad_and_laplacian_mog_density_vectorized(x, means, precisions, temperature=
     
     return gradient, laplacian_over_density
 
-def grad_and_laplacian_mog_density_fused(x, means, precisions, temperature=1.0):
+def grad_and_laplacian_mog_density_fused(
+    x, means, precisions,
+    batch_chunk_size=DEFAULT_BATCH_CHUNK_SIZE,
+    center_chunk_size=DEFAULT_CENTERS_CHUNK_SIZE,
+    temperature=1.0
+):
     """
-    Fused computation to minimize intermediate tensor allocations
+    Fused and double-chunked computation of gradient and laplacian for MoG.
+    Reduces intermediate memory allocations and is faster than the separate steps.
     """
+    device = x.device
+    dtype = x.dtype
     batch_size, dim = x.shape
     num_components = means.shape[0]
-    
-    # Single memory allocation for all intermediate results
-    x_expanded = x.unsqueeze(1)
-    x_mean = x_expanded - means
-    
-    # Fuse precision multiplication with squared distance computation
-    x_mean_flat = x_mean.view(-1, dim)
-    precisions_flat = precisions.repeat(batch_size, 1, 1).view(-1, dim, dim)
-    
-    # Batched matrix-vector multiplication
-    x_mean_cov_flat = torch.bmm(precisions_flat, x_mean_flat.unsqueeze(-1)).squeeze(-1)
-    x_mean_cov = x_mean_cov_flat.view(batch_size, num_components, dim)
-    
-    # Compute squared distances
-    squared_linear = torch.sum(x_mean_cov * x_mean_cov, dim=-1)
-    
-    # Fast log determinant approximation
-    logdet = stable_logdet(precisions)
-    trace_precision = torch.diagonal(precisions, dim1=-2, dim2=-1).sum(dim=-1)
-    
-    # Compute log probabilities
-    log_probs = 0.5 * (logdet.unsqueeze(0) - squared_linear) - 0.5 * dim * LOG_2PI  # log(2π)
-    log_probs = torch.clamp(log_probs, min=-100.0, max=100.0)
-    
-    # Stable softmax with temperature
-    softmax_probs = stable_softmax_jit(log_probs, temperature)
-    
-    # Compute results in single pass
-    gradient = -torch.sum(softmax_probs.unsqueeze(-1) * x_mean_cov, dim=1)
-    laplacian_component = softmax_probs * (squared_linear - trace_precision.unsqueeze(0))
-    laplacian_over_density = torch.sum(laplacian_component, dim=1)
-    
+
+    gradient = torch.zeros(batch_size, dim, dtype=dtype, device=device)
+    laplacian_over_density = torch.zeros(batch_size, dtype=dtype, device=device)
+    log_2pi = torch.log(torch.tensor(2 * torch.pi, device=device, dtype=dtype))
+
+    for b_start in range(0, batch_size, batch_chunk_size):
+        b_end = min(b_start + batch_chunk_size, batch_size)
+        x_chunk = x[b_start:b_end]  # (B_chunk, D)
+        B_chunk = b_end - b_start
+
+        grad_chunk_accum = torch.zeros(B_chunk, dim, dtype=dtype, device=device)
+        lap_chunk_accum = torch.zeros(B_chunk, dtype=dtype, device=device)
+
+        for c_start in range(0, num_components, center_chunk_size):
+            c_end = min(c_start + center_chunk_size, num_components)
+            K_chunk = c_end - c_start
+
+            means_chunk = means[c_start:c_end]
+            precisions_chunk = precisions[c_start:c_end]
+
+            # x_mean: (B_chunk, K_chunk, D)
+            x_mean = x_chunk.unsqueeze(1) - means_chunk.unsqueeze(0)
+
+            # Compute x_mean_cov and squared_linear in one einsum
+            x_mean_cov = torch.einsum("bkd,kde->bke", x_mean, precisions_chunk)
+            squared_linear = (x_mean_cov * x_mean_cov).sum(-1)  # (B_chunk, K_chunk)
+
+            # Precompute logdet and trace
+            log_det = stable_logdet_hybrid(precisions_chunk)
+            trace_chunk = precisions_chunk.diagonal(dim1=-2, dim2=-1).sum(-1)
+
+            # Fused log-probabilities
+            log_probs = 0.5 * (log_det.unsqueeze(0) - squared_linear) - 0.5 * dim * log_2pi
+            log_probs.clamp_(-DEFAULT_LOGPROB_CLAMP, DEFAULT_LOGPROB_CLAMP)
+
+            softmax_probs = stable_softmax_jit(log_probs, temperature=temperature)
+
+            grad_chunk_accum += torch.sum(softmax_probs.unsqueeze(-1) * (-x_mean_cov), dim=1)
+            lap_chunk_accum += torch.sum(softmax_probs * (squared_linear - trace_chunk.unsqueeze(0)), dim=1)
+
+            # Cleanup
+            del x_mean, x_mean_cov, squared_linear, log_probs, softmax_probs, log_det, trace_chunk
+            torch.cuda.empty_cache()
+
+        gradient[b_start:b_end] = grad_chunk_accum
+        laplacian_over_density[b_start:b_end] = lap_chunk_accum
+
+        del grad_chunk_accum, lap_chunk_accum
+        torch.cuda.empty_cache()
+
     return gradient, laplacian_over_density
 
-def grad_and_laplacian_streaming(x, means, precisions, chunk_size=DEFAULT_BATCH_CHUNK_SIZE, temperature=1.0):
+def score_implicit_matching_stable(factornet, samples, centers, base_epsilon=DEFAULT_EPSILON, 
+                                  temperature=DEFAULT_TEMPERATURE, max_attempts=DEFAULT_MAX_ATTEMPTS):
     """
-    Streaming computation with minimal memory footprint
+    Enhanced numerically stable version with strategic memory management
     """
-    batch_size, dim = x.shape
-    num_components = means.shape[0]
-    
-    # Pre-allocate output tensors
-    gradient = torch.zeros(batch_size, dim, dtype=x.dtype, device=x.device)
-    laplacian = torch.zeros(batch_size, dtype=x.dtype, device=x.device)
-    
-    # Process in streaming fashion
-    for start in range(0, batch_size, chunk_size):
-        end = min(start + chunk_size, batch_size)
-        x_chunk = x[start:end]
-        
-        # Compute chunk results
-        grad_chunk, lap_chunk = grad_and_laplacian_mog_density_fused(
-            x_chunk, means, precisions, temperature)
-        
-        # Accumulate results
-        gradient[start:end] = grad_chunk
-        laplacian[start:end] = lap_chunk
-        
-        # No explicit cleanup needed - tensors go out of scope
-    
-    return gradient, laplacian
-
-def grad_and_laplacian_streaming_component_chunked(
-    x, means, precisions, 
-    batch_chunk_size=DEFAULT_BATCH_CHUNK_SIZE, 
-    component_chunk_size=DEFAULT_CENTERS_CHUNK_SIZE, 
-    temperature=1.0):
-    """
-    Streaming over samples AND chunking over components to save memory
-    """
-    batch_size, dim = x.shape
-    num_components = means.shape[0]
-
-    # Pre-allocate outputs
-    gradient = torch.zeros(batch_size, dim, dtype=x.dtype, device=x.device)
-    laplacian = torch.zeros(batch_size, dtype=x.dtype, device=x.device)
-
-    log_2pi = torch.log(torch.tensor(2 * torch.pi, device=x.device, dtype=x.dtype))
-
-    for batch_start in range(0, batch_size, batch_chunk_size):
-        batch_end = min(batch_start + batch_chunk_size, batch_size)
-        x_chunk = x[batch_start:batch_end]  # (batch_chunk, dim)
-
-        # Accumulate component-wise results for this batch chunk
-        all_log_probs_chunks = []
-        all_weighted_grads_chunks = []
-        all_squared_linear_chunks = []
-        all_trace_chunks = []
-
-        for comp_start in range(0, num_components, component_chunk_size):
-            comp_end = min(comp_start + component_chunk_size, num_components)
-
-            means_chunk = means[comp_start:comp_end]                 # (K_chunk, dim)
-            precisions_chunk = precisions[comp_start:comp_end]       # (K_chunk, dim, dim)
-            K_chunk = comp_end - comp_start
-
-            # Compute (x - mu)
-            x_expanded = x_chunk.unsqueeze(1)                         # (B_chunk, 1, dim)
-            x_mean = x_expanded - means_chunk                         # (B_chunk, K_chunk, dim)
-
-            # Precision times (x - mu)
-            x_mean_cov = torch.einsum("kij,bkj->bki", precisions_chunk, x_mean)  # (B_chunk, K_chunk, dim)
-
-            # Squared Mahalanobis distances
-            squared_linear = torch.sum(x_mean_cov.square(), dim=-1)  # (B_chunk, K_chunk)
-
-            # Log det and trace per component chunk
-            log_det = stable_logdet(precisions_chunk)                # (K_chunk,)
-            trace_chunk = torch.diagonal(precisions_chunk, dim1=-2, dim2=-1).sum(dim=-1)  # (K_chunk,)
-
-            # Expand for batch
-            log_det_expanded = log_det.unsqueeze(0).expand(batch_end - batch_start, -1)  # (B_chunk, K_chunk)
-            trace_expanded = trace_chunk.unsqueeze(0).expand(batch_end - batch_start, -1)  # (B_chunk, K_chunk)
-
-            # Log probabilities chunk
-            log_probs_chunk = 0.5 * (log_det_expanded - squared_linear) - 0.5 * dim * log_2pi
-            log_probs_chunk = torch.clamp(log_probs_chunk, min=-DEFAULT_LOGPROB_CLAMP, max=DEFAULT_LOGPROB_CLAMP)
-
-            # Weighted gradients chunk (- P(x - mu))
-            weighted_gradient_chunk = -x_mean_cov  # (B_chunk, K_chunk, dim)
-
-            # Store all partial results to accumulate after all chunks
-            all_log_probs_chunks.append(log_probs_chunk)
-            all_weighted_grads_chunks.append(weighted_gradient_chunk)
-            all_squared_linear_chunks.append(squared_linear)
-            all_trace_chunks.append(trace_expanded)
-
-            # Cleanup chunk to save memory
-            del x_mean, x_mean_cov, squared_linear, log_det, log_probs_chunk, weighted_gradient_chunk, trace_chunk
-
-        # Concatenate over components axis
-        all_log_probs = torch.cat(all_log_probs_chunks, dim=1)           # (B_chunk, K)
-        all_weighted_gradients = torch.cat(all_weighted_grads_chunks, dim=1)  # (B_chunk, K, dim)
-        all_squared_linear = torch.cat(all_squared_linear_chunks, dim=1)  # (B_chunk, K)
-        all_trace_precision = torch.cat(all_trace_chunks, dim=1)         # (B_chunk, K)
-
-        # Softmax over full component dimension (stable, temperature-controlled)
-        softmax_probs = stable_softmax_jit(all_log_probs, temperature=temperature)  # (B_chunk, K)
-
-        # Compute gradient and laplacian
-        grad_chunk = torch.sum(softmax_probs.unsqueeze(-1) * all_weighted_gradients, dim=1)  # (B_chunk, dim)
-        laplacian_component = softmax_probs * (all_squared_linear - all_trace_precision)     # (B_chunk, K)
-        lap_chunk = torch.sum(laplacian_component, dim=1)                                   # (B_chunk,)
-
-        # Assign results back to global tensors
-        gradient[batch_start:batch_end] = grad_chunk
-        laplacian[batch_start:batch_end] = lap_chunk
-
-    return gradient, laplacian
-
-# ===================== #
-# Optimized Main Function
-# ===================== #
-
-def score_implicit_matching_optimized(factornet, samples, centers, 
-                                    base_epsilon=DEFAULT_EPSILON, 
-                                    temperature=DEFAULT_TEMPERATURE, 
-                                    max_attempts=DEFAULT_MAX_ATTEMPTS):
-    """
-    Optimized version with minimal memory usage and maximum speed
-    """
-    dim = centers.shape[-1]
-    centers = centers.detach()  # Detach to avoid unnecessary gradient tracking
-    
-    for attempt in range(max_attempts):
-        try:
-            current_epsilon = base_epsilon * (2 ** attempt)
-            
-            # Forward pass
-            with torch.cuda.amp.autocast(enabled=False):  # Disable autocast for stability
-                factor_eval = factornet(centers)
-            
-            # Fast precision construction
-            precisions = vectors_to_precision_ultra_fast(factor_eval, dim, current_epsilon)
-            
-            # Streaming gradient and Laplacian computation
-            gradient_eval_log, laplacian_over_density = grad_and_laplacian_streaming(
-                samples, centers, precisions, chunk_size=32, temperature=temperature)
-            
-            # Fused final computation
-            gradient_squared = torch.sum(gradient_eval_log * gradient_eval_log, dim=1)
-            loss = 2 * laplacian_over_density - gradient_squared
-            
-            # Quick sanity check
-            if torch.isfinite(loss).all():
-                return loss.mean()
-            elif attempt < max_attempts - 1:
-                continue
-            else:
-                # Return clamped result
-                return torch.clamp(loss, min=-1e10, max=1e10).mean()
-                
-        except Exception as e:
-            if attempt < max_attempts - 1:
-                torch.cuda.empty_cache()
-                continue
-            else:
-                raise e
-    
-    raise RuntimeError("All attempts failed")
-
-def score_implicit_matching_stable_dp(factornet, samples, centers,
-                                   base_epsilon=DEFAULT_EPSILON,
-                                   temperature=DEFAULT_TEMPERATURE,
-                                   max_attempts=DEFAULT_MAX_ATTEMPTS):
-    """
-    Stable score matching with memory logging for DataParallel.
-    """
-
-    n_gpus = torch.cuda.device_count()
-    log_once(f"🚀 Starting computation with DataParallel on {n_gpus} GPUs")
-
+    torch.cuda.reset_peak_memory_stats()
     dim = centers.shape[-1]
     centers = centers.clone()
 
+    # Precomputed identity matrix
+    #PRECISION_EYE = torch.eye(dim, device=centers.device, dtype=centers.dtype)
+
+    # Precomputed lower-triangular indices
+    #TRIL_INDICES = torch.tril_indices(row=dim, col=dim, offset=0, device=centers.device)
+
     for attempt in range(max_attempts):
+        # Initialize variables to None for proper cleanup
         factor_eval = None
         precisions = None
         gradient_eval_log = None
         laplacian_over_density = None
         gradient_eval_log_squared = None
         loss = None
-
+        
         try:
             if attempt != 0:
-                log_once(f"⏱️ Attempt {attempt + 1}/{max_attempts}")
-
+                print(f"\n⏱️ Attempt {attempt + 1}/{max_attempts}")
+            #t0 = time.time()
             current_epsilon = base_epsilon * (2 ** attempt)
 
-            # FACTORNET FORWARD
-            with profile_section("Factor network forward", device_id=0, rank=0):
-                factor_eval = factornet(centers)
+            # === FACTORNET FORWARD ===
+            factor_eval = factornet(centers)
 
-            print_memory_usage_dp()
-
-            # PRECISIONS COMPUTATION
-            with profile_section("Precisions chunked_optimized", device_id=0, rank=0):
-                precisions = vectors_to_precision_chunked_optimized(factor_eval, dim, current_epsilon, 20)
-
-            print_memory_usage_dp()
-
-            del precisions
-            gc.collect()
-            torch.cuda.empty_cache()
-
-            with profile_section("Precisions new", device_id=0, rank=0):
-                precisions = vectors_to_precision_chunked_optimized_new(factor_eval, dim, current_epsilon, 20)
-
-            print_memory_usage_dp()
-
-            if not numerical_health_check_dp(precisions, "precisions"):
+            if not numerical_health_check(factor_eval, "factor_eval"):
                 if attempt < max_attempts - 1:
-                    log_once("❌ Precisions health check failed, retrying...")
+                    print("❌ Factor eval health check failed, retrying...")
+                    raise ValueError("Factor eval health check failed")
+                print("⚠️ Proceeding with potentially unstable factor network output")
+
+            # === PRECISION CONSTRUCTION ===
+            precisions = vectors_to_precision_chunked_optimized_new(factor_eval, dim, current_epsilon, DEFAULT_CENTERS_CHUNK_SIZE)
+            #precisions = vectors_to_precision_precomputed_chunked(factor_eval, dim, current_epsilon, chunk_size=DEFAULT_CENTERS_CHUNK_SIZE, eye=PRECISION_EYE, tril_indices=TRIL_INDICES)
+            if not numerical_health_check(precisions, "precisions"):
+                if attempt < max_attempts - 1:
+                    print("❌ Precisions health check failed, retrying...")
                     raise ValueError("Precisions health check failed")
-                else:
-                    log_once("⚠️ Proceeding with potentially unstable precision matrices")
+                print("⚠️ Proceeding with potentially unstable precision matrices")
 
-            # GRADIENT AND LAPLACIAN
-            with profile_section("Gradient and Laplacian computation", device_id=0, rank=0):
-                gradient_eval_log, laplacian_over_density = grad_and_laplacian_mog_density_chunked_stable(
-                    samples, centers, precisions, temperature=temperature)
-
-            print_memory_usage_dp()
-            del gradient_eval_log, laplacian_over_density
-            gc.collect()
-            torch.cuda.empty_cache()
-            with profile_section("Gradient and Laplacian streamed", device_id=0, rank=0):
-                gradient_eval_log, laplacian_over_density = grad_and_laplacian_streaming_component_chunked(
-                    samples, centers, precisions, temperature=temperature)
-
-            print_memory_usage_dp()
-            del gradient_eval_log, laplacian_over_density
-            gc.collect()
-            torch.cuda.empty_cache()
-            with profile_section("Gradient and Laplacian chunked checkpointed", device_id=0, rank=0):
-                gradient_eval_log, laplacian_over_density = grad_and_laplacian_mog_density_chunked_checkpointed(
-                    samples.detach(), centers, precisions,
-                    temperature=temperature)
-
-            print_memory_usage_dp()
-            del gradient_eval_log, laplacian_over_density
-            gc.collect()
-            torch.cuda.empty_cache()
-            with profile_section("Gradient and Laplacian micro_chunked", device_id=0, rank=0):
-                gradient_eval_log, laplacian_over_density = grad_and_laplacian_mog_density_ultra_chunked(
-                    samples.detach(), centers, precisions,
-                    temperature=temperature)
-            print_memory_usage_dp()
-            del gradient_eval_log, laplacian_over_density
-            gc.collect()
-            torch.cuda.empty_cache()
-            with profile_section("Gradient and Laplacian micro_chunked_checkpt", device_id=0, rank=0):
-                gradient_eval_log, laplacian_over_density = grad_and_laplacian_mog_density_chunked_ultra_checkpointed(
-                    samples.detach(), centers, precisions,
-                    temperature=temperature)
-            print_memory_usage_dp()
-
-            if not numerical_health_check_dp(gradient_eval_log, "gradient_eval_log"):
+            # === GRAD & LAPLACIAN ===
+            # gradient_eval_log, laplacian_over_density = grad_and_laplacian_mog_density_chunked_stable(
+            #     samples, centers, precisions, temperature=temperature)
+            gradient_eval_log, laplacian_over_density = grad_and_laplacian_mog_density_fused(
+                samples, centers, precisions,
+                batch_chunk_size=DEFAULT_BATCH_CHUNK_SIZE,
+                center_chunk_size=DEFAULT_CENTERS_CHUNK_SIZE,
+                temperature=temperature
+            )
+            if not numerical_health_check(gradient_eval_log, "gradient_eval_log"):
                 if attempt < max_attempts - 1:
-                    log_once("❌ Gradient eval health check failed, retrying...")
+                    print("❌ Gradient eval health check failed, retrying...")
                     raise ValueError("Gradient eval health check failed")
-                else:
-                    log_once("⚠️ Proceeding with potentially unstable gradient eval")
-
-            if not numerical_health_check_dp(laplacian_over_density, "laplacian_over_density"):
+                print("⚠️ Proceeding with potentially unstable gradient eval")
+                
+            if not numerical_health_check(laplacian_over_density, "laplacian_over_density"):
                 if attempt < max_attempts - 1:
-                    log_once("❌ Laplacian health check failed, retrying...")
+                    print("❌ Laplacian health check failed, retrying...")
                     raise ValueError("Laplacian health check failed")
-                else:
-                    log_once("⚠️ Proceeding with potentially unstable laplacian")
+                print("⚠️ Proceeding with potentially unstable laplacian")
 
-            with profile_section("Final loss computation", device_id=0, rank=0):
-                gradient_eval_log_squared = torch.sum(gradient_eval_log.square(), dim=1)
-                loss = 2 * laplacian_over_density - gradient_eval_log_squared
-            
-            if numerical_health_check_dp(loss, "loss"):
-                result = loss.mean(dim=0)
-                log_once("✅ Computation completed successfully")
-                return result
+            # === FINAL LOSS ===
+            #t4 = time.time()
+            gradient_eval_log_squared = torch.sum(gradient_eval_log.square(), dim=1)
+            loss = 2 * laplacian_over_density - gradient_eval_log_squared
+
+            #total_time = time.time() - t0
+            if numerical_health_check(loss, "loss"):
+                return loss.mean(dim=0)
             elif attempt < max_attempts - 1:
-                log_once(f"❌ Loss health check failed at attempt {attempt + 1}, retrying...")
+                print(f"❌ Loss health check failed at attempt {attempt + 1}, retrying...")
                 raise ValueError("Loss health check failed")
             else:
-                log_once("⚠️ Returning clamped fallback loss")
-                loss = loss.mean(dim=0)
-                return torch.clamp(loss, min=-1e10, max=1e10)
+                print("⚠️ Returning clamped fallback loss")
+                # Clamp but retain gradient path
+                loss = loss.mean(dim=0)  # preserve reduction over batch
+                clamped_loss = torch.clamp(loss, min=-1e10, max=1e10)
+                return clamped_loss
 
         except Exception as e:
-            log_once(f"❌ Attempt {attempt + 1} failed with error: {e}")
-            safe_cleanup(
-                locals().get("factor_eval"),
-                locals().get("precisions"),
-                locals().get("gradient_eval_log"),
-                locals().get("laplacian_over_density"),
-                locals().get("gradient_eval_log_squared"),
-                locals().get("loss"),
-            )
+            print(f"❌ Attempt {attempt + 1} failed with error: {e}")
+            # Immediate aggressive cleanup on any failure
+            cleanup_vars = [factor_eval, precisions, gradient_eval_log, 
+                          laplacian_over_density, gradient_eval_log_squared, loss]
+            for var in cleanup_vars:
+                if var is not None:
+                    del var
+            import gc
             gc.collect()
             torch.cuda.empty_cache()
-
+            torch.cuda.synchronize()
             if attempt < max_attempts - 1:
-                log_once("Retrying with increased regularization...")
+                print("Retrying with increased regularization...")
             else:
+                # Re-raise on final attempt
                 raise e
-
+        
         finally:
-            safe_cleanup(
-                locals().get("factor_eval"),
-                locals().get("precisions"),
-                locals().get("gradient_eval_log"),
-                locals().get("laplacian_over_density"),
-                locals().get("gradient_eval_log_squared"),
-                locals().get("loss"),
-            )
-            gc.collect()
-            torch.cuda.empty_cache()
-
+            # Proper cleanup - this runs whether we succeed, fail, or continue
+            cleanup_vars = [factor_eval, precisions, gradient_eval_log, 
+                          laplacian_over_density, gradient_eval_log_squared, loss]
+            
+            for var in cleanup_vars:
+                if var is not None:
+                    del var
+            
+            # Only do expensive cleanup on failures or retries
+            if attempt < max_attempts - 1:
+                import gc
+                gc.collect()
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()  # Wait for cleanup to complete
+    
+    # This should never be reached, but just in case
     raise RuntimeError("All attempts failed and no valid result was returned")
 
-# ===================== #
-# Alternative: Memory-Mapped Approach
-# ===================== #
-
-def grad_and_laplacian_memory_mapped(x, means, precisions, temperature=1.0):
+def score_implicit_matching_stable_optimized(factornet, samples, centers, base_epsilon=DEFAULT_EPSILON,
+                                           temperature=DEFAULT_TEMPERATURE, max_attempts=DEFAULT_MAX_ATTEMPTS):
     """
-    Memory-mapped approach for very large tensors
+    Memory-optimized version with aggressive chunking and minimal allocations
+    Specifically designed to handle large numbers of centers (1000+) without OOM
     """
-    batch_size, dim = x.shape
-    num_components = means.shape[0]
+    dim = centers.shape[-1]
+    centers = centers.clone()
+    batch_size = samples.shape[0]
+    num_centers = centers.shape[0]
     
-    # Use torch.cuda.Stream for overlapping computation
-    stream = torch.cuda.Stream()
+    # Dynamic chunk sizing based on available memory and number of centers
+    if num_centers > 1000:
+        center_chunk_size = min(50, DEFAULT_CENTERS_CHUNK_SIZE // 2)  # Smaller chunks for many centers
+        batch_chunk_size = min(32, DEFAULT_BATCH_CHUNK_SIZE // 2)
+    else:
+        center_chunk_size = DEFAULT_CENTERS_CHUNK_SIZE
+        batch_chunk_size = DEFAULT_BATCH_CHUNK_SIZE
     
-    with torch.cuda.stream(stream):
-        # Overlap data movement with computation
-        x_expanded = x.unsqueeze(1)
-        x_mean = x_expanded - means
+    for attempt in range(max_attempts):
+        try:
+            if attempt != 0:
+                print(f"\n⏱️ Optimized attempt {attempt + 1}/{max_attempts}")
+            
+            current_epsilon = base_epsilon * (2 ** attempt)
+            
+            # === FACTORNET FORWARD WITH CHUNKING ===
+            factor_chunks = []
+            for i in range(0, num_centers, center_chunk_size):
+                chunk_end = min(i + center_chunk_size, num_centers)
+                centers_chunk = centers[i:chunk_end]
+                
+                with torch.cuda.device(centers.device):
+                    factor_chunk = factornet(centers_chunk)
+                    factor_chunks.append(factor_chunk.detach())  # Detach to save memory
+                    
+                # Aggressive cleanup
+                del centers_chunk, factor_chunk
+                if i % (center_chunk_size * 4) == 0:
+                    torch.cuda.empty_cache()
+            
+            # Concatenate factor chunks
+            factor_eval = torch.cat(factor_chunks, dim=0)
+            del factor_chunks
+            
+            if not numerical_health_check(factor_eval, "factor_eval"):
+                if attempt < max_attempts - 1:
+                    print("❌ Factor eval health check failed, retrying...")
+                    del factor_eval
+                    torch.cuda.empty_cache()
+                    raise ValueError("Factor eval health check failed")
+                print("⚠️ Proceeding with potentially unstable factor network output")
+            
+            # === PRECISION CONSTRUCTION WITH MICRO-BATCHING ===
+            precision_chunks = []
+            for i in range(0, num_centers, center_chunk_size):
+                chunk_end = min(i + center_chunk_size, num_centers)
+                factor_chunk = factor_eval[i:chunk_end]
+                
+                # Use the most memory-efficient precision function
+                precision_chunk = vectors_to_precision_optimized_new(factor_chunk, dim, current_epsilon)
+                precision_chunks.append(precision_chunk)
+                
+                del factor_chunk, precision_chunk
+                if i % (center_chunk_size * 2) == 0:
+                    torch.cuda.empty_cache()
+            
+            precisions = torch.cat(precision_chunks, dim=0)
+            del precision_chunks, factor_eval
+            
+            if not numerical_health_check(precisions, "precisions"):
+                if attempt < max_attempts - 1:
+                    print("❌ Precisions health check failed, retrying...")
+                    del precisions
+                    torch.cuda.empty_cache()
+                    raise ValueError("Precisions health check failed")
+                print("⚠️ Proceeding with potentially unstable precision matrices")
+            
+            # === GRAD & LAPLACIAN WITH AGGRESSIVE CHUNKING ===
+            gradient_eval_log, laplacian_over_density = grad_and_laplacian_mog_density_fused(
+                samples, centers, precisions,
+                batch_chunk_size=batch_chunk_size,
+                center_chunk_size=center_chunk_size,
+                temperature=temperature
+            )
+            
+            del precisions  # Free immediately after use
+            
+            if not numerical_health_check(gradient_eval_log, "gradient_eval_log"):
+                if attempt < max_attempts - 1:
+                    print("❌ Gradient eval health check failed, retrying...")
+                    del gradient_eval_log, laplacian_over_density
+                    torch.cuda.empty_cache()
+                    raise ValueError("Gradient eval health check failed")
+                print("⚠️ Proceeding with potentially unstable gradient eval")
+                
+            if not numerical_health_check(laplacian_over_density, "laplacian_over_density"):
+                if attempt < max_attempts - 1:
+                    print("❌ Laplacian health check failed, retrying...")
+                    del gradient_eval_log, laplacian_over_density
+                    torch.cuda.empty_cache()
+                    raise ValueError("Laplacian health check failed")
+                print("⚠️ Proceeding with potentially unstable laplacian")
+            
+            # === FINAL LOSS ===
+            gradient_eval_log_squared = torch.sum(gradient_eval_log.square(), dim=1)
+            loss = 2 * laplacian_over_density - gradient_eval_log_squared
+            
+            # Cleanup intermediate tensors
+            del gradient_eval_log, laplacian_over_density, gradient_eval_log_squared
+            
+            if numerical_health_check(loss, "loss"):
+                return loss.mean(dim=0)
+            elif attempt < max_attempts - 1:
+                print(f"❌ Loss health check failed at attempt {attempt + 1}, retrying...")
+                del loss
+                torch.cuda.empty_cache()
+                raise ValueError("Loss health check failed")
+            else:
+                print("⚠️ Returning clamped fallback loss")
+                loss = loss.mean(dim=0)
+                clamped_loss = torch.clamp(loss, min=-1e10, max=1e10)
+                return clamped_loss
         
-        # Process in micro-batches to reduce peak memory
-        micro_batch_size = 16
-        gradients = []
-        laplacians = []
-        
-        for i in range(0, batch_size, micro_batch_size):
-            end_idx = min(i + micro_batch_size, batch_size)
-            x_micro = x_mean[i:end_idx]
-            
-            # Compute for micro-batch
-            x_mean_cov = torch.einsum('kij,bkj->bki', precisions, x_micro)
-            squared_linear = torch.sum(x_mean_cov * x_mean_cov, dim=-1)
-            
-            # Fast log probabilities
-            logdet = stable_logdet_fast(precisions)
-            log_probs = 0.5 * (logdet.unsqueeze(0) - squared_linear) - 0.5 * dim * 1.8378770664093453
-            log_probs = torch.clamp(log_probs, min=-100.0, max=100.0)
-            
-            # Compute results
-            softmax_probs = stable_softmax_jit(log_probs, temperature)
-            gradient_micro = -torch.sum(softmax_probs.unsqueeze(-1) * x_mean_cov, dim=1)
-            
-            trace_precision = torch.diagonal(precisions, dim1=-2, dim2=-1).sum(dim=-1)
-            laplacian_micro = torch.sum(softmax_probs * (squared_linear - trace_precision.unsqueeze(0)), dim=1)
-            
-            gradients.append(gradient_micro)
-            laplacians.append(laplacian_micro)
+        except Exception as e:
+            print(f"❌ Optimized attempt {attempt + 1} failed with error: {e}")
+            # Aggressive cleanup on failure
+            import gc
+            gc.collect()
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            if attempt < max_attempts - 1:
+                print("Retrying with increased regularization...")
+            else:
+                raise e
     
-    # Concatenate results
-    gradient = torch.cat(gradients, dim=0)
-    laplacian = torch.cat(laplacians, dim=0)
-    
-    return gradient, laplacian
-
+    raise RuntimeError("All optimized attempts failed and no valid result was returned")

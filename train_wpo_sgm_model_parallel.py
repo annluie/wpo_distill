@@ -2,11 +2,14 @@ import torch
 import torch.nn as nn
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.cuda.amp import GradScaler, autocast
 import os
 import sys
 from typing import List, Tuple
 import gc
 from tqdm import trange
+import concurrent.futures
+import threading
 
 # Import your existing modules
 from WPO_SGM import functions_WPO_SGM_stable as LearnCholesky
