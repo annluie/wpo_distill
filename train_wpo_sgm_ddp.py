@@ -38,7 +38,9 @@ import torch._dynamo
 torch._dynamo.config.suppress_errors = True
 # ------------------- PROJECT MODULES -------------------
 from utilities.plots import *
+from utilities.plots import *
 #from WPO_SGM import functions_WPO_SGM as LearnCholesky
+from WPO_SGM import functions_WPO_SGM_stable as LearnCholesky
 from WPO_SGM import functions_WPO_SGM_stable as LearnCholesky
 from WPO_SGM import toy_data
 ###################
@@ -194,6 +196,7 @@ def gather_and_print_all_gpu_memory(rank, world_size, step):
 
 compiled_loss = torch.compile(
         LearnCholesky.score_implicit_matching_stable, 
+        LearnCholesky.score_implicit_matching_stable, 
         mode="reduce-overhead"  # Better for training loops
     )
 def evaluate_model(factornet, kernel_centers, num_test_sample, dataset, stab, world_size): 
@@ -227,6 +230,7 @@ def opt_check(factornet, samples, centers, optimizer, stab):
     '''
     optimizer.zero_grad(set_to_none=True)
     #loss = LearnCholesky.score_implicit_matching_stable(factornet, samples, centers, stab)
+    loss = LearnCholesky.score_implicit_matching_stable(factornet, samples, centers, stab)
     loss = LearnCholesky.score_implicit_matching_stable(factornet, samples, centers, stab)
     torch.autograd.set_detect_anomaly(True)
     loss.backward()
@@ -334,6 +338,7 @@ def main_worker(rank, world_size, args):
     
     # ------------------- SET PARAMETERS -------------------
     torch.set_float32_matmul_precision('high')
+    LearnCholesky.setup_optimal_device_settings()
     LearnCholesky.setup_optimal_device_settings()
     
     # Extract parameters from args
@@ -463,6 +468,7 @@ def main_worker(rank, world_size, args):
         torch.save(centers, centers_file)
         filename_final = os.path.join(save_directory, 'centers.png')
         plot_and_save_centers(centers, filename_final)
+        plot_and_save_centers(centers, filename_final)
     ###########################
     # Training loop
     ###########################
@@ -542,7 +548,9 @@ def main_worker(rank, world_size, args):
                 with torch.no_grad():
                     filename_step_sample = os.path.join(save_directory, f"step{step:05d}")
                     plot_images_with_model(factornet, centers, plot_number=10, eps=stab, save_path=filename_step_sample)
+                    plot_images_with_model(factornet, centers, plot_number=10, eps=stab, save_path=filename_step_sample)
                     logging.info(f"Saved samples at step {step} to {filename_step_sample}")
+                    generated = sample_from_model(factornet, training_samples, sample_number=10, eps=stab)
                     generated = sample_from_model(factornet, training_samples, sample_number=10, eps=stab)
                     l2 = torch.mean((generated - training_samples[:10])**2).item()
                     print(f"[Step {step}] L2 to training data: {l2:.2f}")
@@ -571,6 +579,7 @@ def main_worker(rank, world_size, args):
 
         #---------------------------- Sample and save -------------------
         with torch.no_grad():
+            plot_images_with_model(factornet, centers, plot_number=10, save_path=save_directory)
             plot_images_with_model(factornet, centers, plot_number=10, save_path=save_directory)
             logging.info(f'Sampled images saved to {save_directory}_sampled_images.png')
     
