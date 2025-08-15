@@ -76,8 +76,9 @@ class OptimizedModelParallelWPO(ModelParallelWPO):
             self._samples_cache[i].copy_(samples, non_blocking=True)
         
         # Compute loss components on each device
-        loss_components = []
-        
+        density_components = []
+        grad_components = []
+        lap_components = []
         for i, device_id in enumerate(self.device_ids):
             device_samples = self._samples_cache[i]
             device_centers = self.centers_per_device[i]
@@ -95,21 +96,23 @@ class OptimizedModelParallelWPO(ModelParallelWPO):
                 # else:
                 #     loss_component = LearnCholesky.score_implicit_matching_stable(
                 #         device_factornet, device_samples, device_centers, stab)
-                loss_component = LearnCholesky.score_implicit_matching_stable_optimized(
-                        device_factornet, device_samples, device_centers, stab)
-                loss_components.append(loss_component)
-        
+            
+                density_component, grad_component, lap_component = LearnCholesky.score_implicit_matching_parallel(
+                    device_factornet, device_samples, device_centers, stab)
+                density_components.append(density_component)
+                grad_components.append(grad_component)
+                lap_components.append(lap_component)
+                del density_component, grad_component, lap_component  # Free memory immediately
+                
+        # combine results and compute final loss
+        density = (torch.stack(density_components, dim=0).sum(dim=0)) / centers.shape[0]
+        gradient_eval_log = torch.stack(grad_components, dim=0)
+        laplacian_over_density = torch.stack(lap_components, dim=0)
         # Efficiently combine losses
-        if len(loss_components) == 1:
-            return loss_components[0]
-        
-        main_device = f'cuda:{self.device_ids[0]}'
-        total_loss = loss_components[0]
-        
-        for loss_component in loss_components[1:]:
-            total_loss = total_loss + loss_component.to(main_device, non_blocking=True)
-        
-        return total_loss / len(loss_components)
+        gradient_eval_log = gradient_eval_log / density
+        laplacian_over_density = laplacian_over_density / density
+        loss = 2 * laplacian_over_density - torch.sum(gradient_eval_log.square(), dim=1)
+        return loss
 
 ###################
 # functions

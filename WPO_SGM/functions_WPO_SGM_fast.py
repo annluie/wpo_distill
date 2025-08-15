@@ -548,6 +548,174 @@ def grad_and_laplacian_mog_density_vectorized(x, means, precisions, temperature=
     
     return gradient, laplacian_over_density
 
+def grad_and_lapl_parallel(x,means,precisions, batch_chunk_size=DEFAULT_BATCH_CHUNK_SIZE,
+    center_chunk_size=DEFAULT_CENTERS_CHUNK_SIZE,
+    temperature=1.0):
+    '''
+    Returns all the components needed when splitting centers for gpus
+    '''
+    device = x.device
+    dtype = x.dtype
+    batch_size, dim = x.shape
+    num_components = means.shape[0]
+
+    gradient = torch.zeros(batch_size, dim, dtype=dtype, device=device)
+    laplacian_over_density = torch.zeros(batch_size, dtype=dtype, device=device)
+    density = torch.zeros(batch_size, dtype=dtype, device=device)
+    log_2pi = torch.log(torch.tensor(2 * torch.pi, device=device, dtype=dtype))
+    
+    for b_start in range(0, batch_size, batch_chunk_size):
+        b_end = min(b_start + batch_chunk_size, batch_size)
+        x_chunk = x[b_start:b_end]  # (B_chunk, D)
+        B_chunk = b_end - b_start
+
+        grad_chunk_accum = torch.zeros(B_chunk, dim, dtype=dtype, device=device)
+        lap_chunk_accum = torch.zeros(B_chunk, dtype=dtype, device=device)
+        dens_chunk_accum = torch.zeros(B_chunk, dtype=dtype, device=device)
+
+        for c_start in range(0, num_components, center_chunk_size):
+            c_end = min(c_start + center_chunk_size, num_components) #K_chunk = c_end - c_start
+
+            means_chunk = means[c_start:c_end]
+            precisions_chunk = precisions[c_start:c_end]
+
+            # x_mean: (B_chunk, K_chunk, D)
+            x_mean = x_chunk.unsqueeze(1) - means_chunk.unsqueeze(0)
+
+            # Apply full precision matrix: (K_chunk, D, D) × (B, K_chunk, D) -> (B, K_chunk, D)
+            x_mean_cov = torch.einsum("kij,bkj->bki", precisions_chunk, x_mean)
+            # compute the squared norm of x_mean_cov
+            squared_cov = torch.sum(x_mean_cov.square(), dim=-1)  # (B_chunk, K_chunk)
+
+            # Mahalanobis squared term: (x - μ)ᵀ Γ (x - μ)
+            squared_linear = (x_mean_cov * x_mean).sum(dim=-1)  # (B, K_chunk)
+
+            # Precompute logdet and trace
+            log_det = stable_logdet_hybrid(precisions_chunk)
+            
+            # Fused log-probabilities
+            log_probs = 0.5 * (log_det.unsqueeze(0) - squared_linear) - 0.5 * dim * log_2pi
+            log_probs.clamp_(-DEFAULT_LOGPROB_CLAMP, DEFAULT_LOGPROB_CLAMP)
+            
+            # compute density
+            density_chunk = torch.exp(log_probs)  # (B_chunk, K_chunk)
+            dens_chunk_accum += density_chunk.sum(dim=1)  # (B_chunk,)
+
+            trace_chunk = precisions_chunk.diagonal(dim1=-2, dim2=-1).sum(-1)
+            grad_chunk_accum += torch.sum(density_chunk * (-x_mean_cov), dim=1)
+            lap_chunk_accum += torch.sum(density_chunk * (squared_cov - trace_chunk.unsqueeze(0)), dim=1)
+
+            # Cleanup
+            del x_mean, x_mean_cov, squared_linear, log_probs, log_det, trace_chunk
+            torch.cuda.empty_cache()
+
+        gradient[b_start:b_end] = grad_chunk_accum
+        laplacian_over_density[b_start:b_end] = lap_chunk_accum
+        density[b_start:b_end] = dens_chunk_accum
+        del grad_chunk_accum, lap_chunk_accum, dens_chunk_accum
+        torch.cuda.empty_cache()
+    return density, gradient, laplacian_over_density
+
+def score_implicit_matching_parallel(factornet, samples, centers, base_epsilon=DEFAULT_EPSILON, 
+                                  temperature=DEFAULT_TEMPERATURE, max_attempts=DEFAULT_MAX_ATTEMPTS):
+    """
+    Returns components needed when splitting centers using model parallel
+    """
+    torch.cuda.reset_peak_memory_stats()
+    dim = centers.shape[-1]
+    centers = centers.clone()
+    for attempt in range(max_attempts):
+        # Initialize variables to None for proper cleanup
+        factor_eval = None
+        precisions = None
+        gradient_eval_log = None
+        laplacian_over_density = None
+        gradient_eval_log_squared = None
+        loss = None
+        
+        try:
+            if attempt != 0:
+                print(f"\n⏱️ Attempt {attempt + 1}/{max_attempts}")
+            #t0 = time.time()
+            current_epsilon = base_epsilon * (2 ** attempt)
+
+            # === FACTORNET FORWARD ===
+            factor_eval = factornet(centers)
+
+            if not numerical_health_check(factor_eval, "factor_eval"):
+                if attempt < max_attempts - 1:
+                    print("❌ Factor eval health check failed, retrying...")
+                    raise ValueError("Factor eval health check failed")
+                print("⚠️ Proceeding with potentially unstable factor network output")
+
+            # === PRECISION CONSTRUCTION ===
+            precisions = vectors_to_precision_chunked_optimized_new(factor_eval, dim, current_epsilon, DEFAULT_CENTERS_CHUNK_SIZE)
+            #precisions = vectors_to_precision_precomputed_chunked(factor_eval, dim, current_epsilon, chunk_size=DEFAULT_CENTERS_CHUNK_SIZE, eye=PRECISION_EYE, tril_indices=TRIL_INDICES)
+            if not numerical_health_check(precisions, "precisions"):
+                if attempt < max_attempts - 1:
+                    print("❌ Precisions health check failed, retrying...")
+                    raise ValueError("Precisions health check failed")
+                print("⚠️ Proceeding with potentially unstable precision matrices")
+
+            # === GRAD & LAPLACIAN ===
+            density, gradient_eval_log, laplacian_over_density = grad_and_lapl_parallel(
+                samples, centers, precisions,
+                batch_chunk_size=DEFAULT_BATCH_CHUNK_SIZE,
+                center_chunk_size=DEFAULT_CENTERS_CHUNK_SIZE,
+                temperature=temperature
+            )
+            if not numerical_health_check(gradient_eval_log, "gradient_eval_log"):
+                if attempt < max_attempts - 1:
+                    print("❌ Gradient eval health check failed, retrying...")
+                    raise ValueError("Gradient eval health check failed")
+                print("⚠️ Proceeding with potentially unstable gradient eval")
+                
+            if not numerical_health_check(laplacian_over_density, "laplacian_over_density"):
+                if attempt < max_attempts - 1:
+                    print("❌ Laplacian health check failed, retrying...")
+                    raise ValueError("Laplacian health check failed")
+                print("⚠️ Proceeding with potentially unstable laplacian")
+
+            return density, gradient_eval_log, laplacian_over_density
+
+        except Exception as e:
+            print(f"❌ Attempt {attempt + 1} failed with error: {e}")
+            # Immediate aggressive cleanup on any failure
+            cleanup_vars = [factor_eval, precisions, gradient_eval_log, 
+                          laplacian_over_density, gradient_eval_log_squared, loss]
+            for var in cleanup_vars:
+                if var is not None:
+                    del var
+            import gc
+            gc.collect()
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            if attempt < max_attempts - 1:
+                print("Retrying with increased regularization...")
+            else:
+                # Re-raise on final attempt
+                raise e
+        
+        finally:
+            # Proper cleanup - this runs whether we succeed, fail, or continue
+            cleanup_vars = [factor_eval, precisions, gradient_eval_log, 
+                          laplacian_over_density, gradient_eval_log_squared, loss]
+            
+            for var in cleanup_vars:
+                if var is not None:
+                    del var
+            
+            # Only do expensive cleanup on failures or retries
+            if attempt < max_attempts - 1:
+                import gc
+                gc.collect()
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()  # Wait for cleanup to complete
+    
+    # This should never be reached, but just in case
+    raise RuntimeError("All attempts failed and no valid result was returned")
+
+
 def grad_and_laplacian_mog_density_fused(
     x, means, precisions,
     batch_chunk_size=DEFAULT_BATCH_CHUNK_SIZE,
@@ -585,9 +753,11 @@ def grad_and_laplacian_mog_density_fused(
             # x_mean: (B_chunk, K_chunk, D)
             x_mean = x_chunk.unsqueeze(1) - means_chunk.unsqueeze(0)
 
-            # Compute x_mean_cov and squared_linear in one einsum
-            x_mean_cov = torch.einsum("bkd,kde->bke", x_mean, precisions_chunk)
-            squared_linear = (x_mean_cov * x_mean_cov).sum(-1)  # (B_chunk, K_chunk)
+            # Apply full precision matrix: (K_chunk, D, D) × (B, K_chunk, D) -> (B, K_chunk, D)
+            x_mean_cov = torch.einsum("kij,bkj->bki", precisions_chunk, x_mean)
+
+            # Mahalanobis squared term: (x - μ)ᵀ Γ (x - μ)
+            squared_linear = (x_mean_cov * x_mean).sum(dim=-1)  # (B, K_chunk)
 
             # Precompute logdet and trace
             log_det = stable_logdet_hybrid(precisions_chunk)
